@@ -1,0 +1,33 @@
+---
+# Ordered entry point. Each import keeps its own gates, so an unrunnable step stops on its
+# own assertion instead of running because it happened to be next in the file.
+#
+#   ansible-playbook playbooks/site.yml --list-tags
+#   ansible-playbook playbooks/site.yml --tags preflight
+#   ansible-playbook playbooks/site.yml --tags upgrade   -e change_ticket=CHG-xxxx -e hop=6.0 -e confirm_window=YES
+#   ansible-playbook playbooks/site.yml --tags keys      -e change_ticket=CHG-xxxx -e confirm_window=YES
+#   ansible-playbook playbooks/site.yml --tags encrypt   -e change_ticket=CHG-xxxx -e confirm_window=YES -e confirm_wipe=WIPE
+#   ansible-playbook playbooks/site.yml --tags tls       -e change_ticket=CHG-xxxx -e confirm_window=YES
+#   ansible-playbook playbooks/site.yml --tags verify    -e change_ticket=CHG-xxxx
+#
+# NO BACKUP in this change (ops decision): 01-backup.yml is intentionally not imported below.
+- import_playbook: 00-preflight.yml
+  tags: [preflight]
+
+# 01-backup.yml is deliberately NOT imported here: this change runs without a backup.
+# It remains runnable on its own (ansible-playbook playbooks/01-backup.yml -e change_ticket=… -e confirm_backup=YES).
+
+- import_playbook: 02-upgrade.yml
+  tags: [upgrade]
+
+- import_playbook: 03-encryption-keys.yml
+  tags: [keys]
+
+- import_playbook: 04-encrypt-nodes.yml
+  tags: [encrypt]
+
+- import_playbook: 05-tls.yml
+  tags: [tls]
+
+- import_playbook: 06-verify.yml
+  tags: [verify]

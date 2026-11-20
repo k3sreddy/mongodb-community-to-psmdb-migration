@@ -1,0 +1,21 @@
+# EXAMPLE ONLY — copy to inventory/group_vars/prod_live/vault.yml and encrypt:
+#
+#   mkdir -p inventory/group_vars/prod_live
+#   cp inventory/group_vars/prod_live.vault.yml.example inventory/group_vars/prod_live/vault.yml
+#   ansible-vault encrypt --vault-password-file ~/.ansible-vault-pass \
+#       inventory/group_vars/prod_live/vault.yml
+#   chmod 600 inventory/group_vars/prod_live/vault.yml
+#
+# WHY THE DIRECTORY: Ansible only loads group_vars that match a group name — either
+# group_vars/prod_live.yml, or ANY file inside group_vars/prod_live/. A sibling file named
+# group_vars/prod_live.vault.yml is treated as vars for a group called "prod_live.vault" and is
+# silently ignored, which leaves ansible_password unset with no error. That cost a debugging
+# session on 2026-11-19; do not move this file back out of the directory.
+#
+# ansible.cfg already points vault_password_file at ~/.ansible-vault-pass, so no run needs
+# --ask-vault-pass. Never commit the encrypted file's password or real values in this example.
+---
+vault_ansible_password: "REPLACE_ME"                 # root SSH password fallback (prefer keys)
+vault_mongo_admin_password: "REPLACE_ME"             # admin@admin; rotate in W3 — currently shared with the reference cluster
+vault_audit_rotator_password: "REPLACE_ME"           # least-privilege logRotate user
+vault_mongo_backup_password: "REPLACE_ME"            # if a dedicated backup user exists

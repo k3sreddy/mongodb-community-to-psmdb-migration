@@ -1,0 +1,129 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────────────
+# 00b | PREREQUISITES: mongosh + the Percona repo tooling.
+#
+# This is NOT part of the upgrade window and it does not touch mongod, its config, or its
+# data. It only adds two things that the rest of the project assumes but that do not exist
+# on a stock community-5.0 node:
+#
+#   1. mongosh — every read and every gate in this project drives `mongosh`. The legacy
+#      `mongo` binary is owned by mongodb-org-shell, which the first hop REMOVES, so without
+#      this the run dies immediately after the packages are swapped and mongod is stopped.
+#      Verified on 2026-11-19: only mongodb-org-shell-5.0.8 was installed; mongosh was absent.
+#   2. percona-release — tasks/node-upgrade.yml calls it to enable exactly one PSMDB repo per
+#      hop. Verified on 2026-11-19: it was not installed on any member.
+#
+# Run this BEFORE Phase 1 and before 00-preflight if you want the modern shell in the baseline:
+#     ansible-playbook playbooks/00b-bootstrap.yml -e change_ticket=CHG-xxxx -e confirm_window=YES
+# ─────────────────────────────────────────────────────────────────────────────────────
+- name: "00b | prerequisites (additive only: mongosh + percona-release)"
+  hosts: prod_live
+  gather_facts: false
+  tasks:
+    - name: "00b | gate"
+      ansible.builtin.assert:
+        that:
+          - change_ticket is defined and change_ticket | length > 3
+          - confirm_window | default('') == 'YES'
+          - ansible_host in allowed_member_ips
+          - ansible_host not in forbidden_member_ips
+        fail_msg: >-
+          Refusing to run. Pass -e change_ticket=CHG-xxxx -e confirm_window=YES, and make sure
+          the target is one of {{ allowed_member_ips }} (the second set is never a target).
+        quiet: true
+
+    - name: "00b | the repo must be reachable from the node"
+      ansible.builtin.command:
+        argv: [curl, -sS, -o, /dev/null, -w, "%{http_code}", --max-time, "20",
+               "https://repo.percona.com/yum/"]
+      register: repo_http
+      changed_when: false
+      check_mode: false
+
+    - name: "00b | repo reachability gate"
+      ansible.builtin.assert:
+        that:
+          - repo_http.stdout | trim == '200'
+        fail_msg: >-
+          {{ inventory_hostname }} cannot reach repo.percona.com
+          (HTTP {{ repo_http.stdout | default('no response') | trim }}). Package installation
+          will fail mid-window — fix egress or use an internal mirror before proceeding.
+        quiet: true
+
+    - name: "00b | percona-release installed?"
+      ansible.builtin.command:
+        argv: [rpm, -q, percona-release]
+      register: percona_release_present
+      changed_when: false
+      failed_when: false
+
+    - name: "00b | install percona-release"
+      ansible.builtin.command:
+        argv: [dnf, -y, install, "https://repo.percona.com/yum/percona-release-latest.noarch.rpm"]
+      register: percona_release_install
+      when: percona_release_present.rc | default(1) | int != 0
+
+    - name: "00b | percona-release must now be present"
+      ansible.builtin.command:
+        argv: [rpm, -q, percona-release]
+      register: percona_release_after
+      changed_when: false
+      failed_when: false
+
+    - name: "00b | percona-release install gate"
+      ansible.builtin.assert:
+        that:
+          - percona_release_after.rc is defined
+          - percona_release_after.rc | int == 0
+        fail_msg: >-
+          percona-release is still missing on {{ inventory_hostname }}. The upgrade playbook
+          cannot enable a PSMDB repo without it
+          ({{ percona_release_install.stderr | default('') | truncate(200) }}).
+        quiet: true
+
+    - name: "00b | mongosh already installed?"
+      ansible.builtin.command:
+        argv: [rpm, -q, percona-mongodb-mongosh]
+      register: mongosh_present
+      changed_when: false
+      failed_when: false
+
+    - name: "00b | enable the PSMDB 6.0 repo (source of the mongosh package)"
+      ansible.builtin.shell: |
+        percona-release enable psmdb-60 release >/dev/null
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: mongosh_present.rc | default(1) | int != 0
+
+    # percona-mongodb-mongosh is the Percona build of mongosh (verified present in
+    # psmdb-60/yum/release/8 on 2026-11-19, latest 2.8.3). It is independent of the server
+    # package, so installing it now does not touch mongod.
+    - name: "00b | install mongosh"
+      ansible.builtin.command:
+        argv: [dnf, -y, install, percona-mongodb-mongosh]
+      register: mongosh_install
+      when: mongosh_present.rc | default(1) | int != 0
+
+    - name: "00b | mongosh must run and be >= 2.0"
+      ansible.builtin.command:
+        argv: [mongosh, --version]
+      register: mongosh_version_check
+      changed_when: false
+      failed_when: false
+
+    - name: "00b | mongosh gate"
+      ansible.builtin.assert:
+        that:
+          - mongosh_version_check.rc is defined
+          - mongosh_version_check.rc | int == 0
+          - mongosh_version_check.stdout is search('mongosh')
+        fail_msg: >-
+          mongosh is not usable on {{ inventory_hostname }} after installation
+          ({{ mongosh_install.stderr | default(mongosh_version_check.stderr) | default('') | truncate(200) }}).
+          Every read and every gate in this project depends on it; do not open a window.
+        quiet: true
+
+    - name: "00b | mongosh version"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ mongosh_version_check.stdout | trim }}"

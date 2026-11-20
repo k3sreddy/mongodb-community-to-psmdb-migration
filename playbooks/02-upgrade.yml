@@ -1,0 +1,174 @@
+---
+# 02 — One major hop, rolling, zero data loss. Run once per hop: 6.0 → 7.0 → 8.0.
+#   ansible-playbook playbooks/02-upgrade.yml -e confirm_window=YES -e hop=6.0
+#   6.0 first start is slow and can exceed the default timeout.
+- name: "02 | Hop {{ hop | default('?') }} | gate"
+  hosts: prod_live
+  gather_facts: false
+  # Every step below runs after the community packages are removed, and the legacy `mongo`
+  # binary belongs to them. Refuse to start unless mongosh is present (preflight-common.yml).
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "02 | window gate"
+      ansible.builtin.assert:
+        that:
+          - change_ticket is defined and change_ticket | length > 3
+          - "'hop' is defined and hop in upgrade_hops | map(attribute='major') | list"
+          - confirm_window | default('') == 'YES'
+        fail_msg: >-
+          Refusing to run. Pass -e change_ticket=CHG-xxxx -e hop=<6.0|7.0|8.0>
+          -e confirm_window=YES from inside the approved window (README §5, gate G-B).
+        quiet: true
+
+    - name: "02 | identity, membership and health (guardrail G1)"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "02 | register the current primary"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: prod_live_primary
+      loop: "{{ groups['prod_live'] }}"
+      when: hostvars[item].mongo_hello.isWritablePrimary | default(false)
+      run_once: true
+      changed_when: false
+
+    - name: "02 | register the secondaries"
+      ansible.builtin.add_host:
+        name: "{{ item }}"
+        groups: prod_live_secondary
+      loop: "{{ groups['prod_live'] }}"
+      when: not (hostvars[item].mongo_hello.isWritablePrimary | default(false))
+      run_once: true
+      changed_when: false
+
+    - name: "02 | exactly one primary must exist"
+      ansible.builtin.assert:
+        that:
+          - groups['prod_live_primary'] | length == 1
+          - groups['prod_live_secondary'] | length == 2
+        fail_msg: "Expected 1 primary + 2 secondaries, got {{ groups['prod_live_primary'] }} / {{ groups['prod_live_secondary'] }}."
+        quiet: true
+      run_once: true
+
+    - name: "02 | current topology"
+      ansible.builtin.debug:
+        msg:
+          - "PRIMARY  : {{ groups['prod_live_primary'] | join(', ') }} (upgraded LAST)"
+          - "SECONDARY: {{ groups['prod_live_secondary'] | join(', ') }} (upgraded first, one at a time)"
+          - "hop {{ hop }} → {{ upgrade_hops | selectattr('major', 'equalto', hop) | map(attribute='package') | first }}"
+      run_once: true
+
+# ── Secondaries, strictly one at a time ────────────────────────────────────────
+- name: "02 | Hop {{ hop | default('?') }} | rolling upgrade — secondaries"
+  hosts: prod_live_secondary
+  serial: 1
+  max_fail_percentage: 0
+  gather_facts: false
+  # destructive: the legacy mongo binary is gone once the community packages go
+    # (see group_vars/all.yml and tasks/preflight-common.yml)
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "02 | {{ inventory_hostname }} | re-verify before touching this member"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "02 | {{ inventory_hostname }} | binary swap"
+      ansible.builtin.include_tasks: ../tasks/node-upgrade.yml
+
+# ── Primary last: graceful stepDown first (guardrail G2) ───────────────────────
+- name: "02 | Hop {{ hop | default('?') }} | rolling upgrade — primary (last)"
+  hosts: prod_live_primary
+  serial: 1
+  max_fail_percentage: 0
+  gather_facts: false
+  # destructive: the legacy mongo binary is gone once the community packages go
+    # (see group_vars/all.yml and tasks/preflight-common.yml)
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "02 | {{ inventory_hostname }} | re-verify before touching this member"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "02 | {{ inventory_hostname }} | graceful stepDown before restart"
+      ansible.builtin.include_tasks: ../tasks/stepdown.yml
+      vars:
+        stepdown_seconds: 300
+
+    - name: "02 | {{ inventory_hostname }} | binary swap"
+      ansible.builtin.include_tasks: ../tasks/node-upgrade.yml
+
+  # ── The priority-2 member must win the election back ─────────────────────────
+- name: "02 | Hop {{ hop | default('?') }} | confirm the priority-2 member is primary again"
+  hosts: prod_live_primary
+  gather_facts: false
+  # destructive: the legacy mongo binary is gone once the community packages go
+    # (see group_vars/all.yml and tasks/preflight-common.yml)
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "02 | wait for re-election"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify({p:db.hello().isWritablePrimary})'] }}"
+      register: reelect
+      changed_when: false
+      check_mode: false
+      no_log: true
+      until: (reelect.stdout | from_json).p
+      retries: 30
+      delay: 15
+      failed_when: false
+
+    - name: "02 | primary role must be restored before FCV is touched"
+      ansible.builtin.assert:
+        that:
+          - (reelect.stdout | from_json).p | default(false)
+        fail_msg: >-
+          {{ inventory_hostname }} did not regain PRIMARY. FCV must be set on the primary —
+          locate the primary first, do not set FCV from a secondary.
+        quiet: true
+
+# ── FCV bump last, cluster-wide (no host is hard-coded: the driver finds the primary)
+- name: "02 | Hop {{ hop | default('?') }} | set FCV to {{ hop | default('?') }}"
+  hosts: prod_live
+  gather_facts: false
+  # Every step below runs after the community packages are removed, and the legacy `mongo`
+  # binary belongs to them. Refuse to start unless mongosh is present (preflight-common.yml).
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "02 | resolve hop definition"
+      ansible.builtin.set_fact:
+        hop_def: "{{ upgrade_hops | selectattr('major', 'equalto', hop) | first }}"
+
+    - name: "02 | set FCV on the current primary"
+      ansible.builtin.command:
+        argv: "{{ mongo_rs_argv + ['--eval', fcv_expr] }}"
+      vars:
+        fcv_expr: >-
+          db.adminCommand({setFeatureCompatibilityVersion: '{{ hop }}'
+          {%- if hop_def.fcv_confirm %}, confirm: true{% endif %}})
+      run_once: true
+      register: fcv_result
+      changed_when: true
+      no_log: true
+
+    - name: "02 | re-read version and FCV on every member"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "02 | every member must report {{ hop }} binary and FCV"
+      ansible.builtin.assert:
+        that:
+          - mongo_build.version is search('^' ~ (hop | regex_escape))
+          - mongo_fcv | string is search('^' ~ (hop | regex_escape))
+          - mongo_rs_status.members | selectattr('health', 'equalto', 1) | list | length == 3
+        fail_msg: >-
+          {{ inventory_hostname }}: version={{ mongo_build.version }} fcv={{ mongo_fcv }}.
+          Hop {{ hop | default('?') }} is NOT complete on this member.
+        quiet: true
+
+    - name: "02 | hop {{ hop | default('?') }} complete"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{ mongo_build.version }} (psmdb {{ mongo_build.psmdbVersion | default('n/a') }}),
+          FCV {{ mongo_fcv }} — next hop only after 00/06 verification.

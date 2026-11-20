@@ -1,0 +1,282 @@
+---
+# 05 — TLS enabled, with BOTH TLS and non-TLS client connections accepted. This is the END STATE
+# of this change, by decision: net.tls.mode = preferTLS.
+#
+#   * members replicate to each other over TLS
+#   * clients may connect with TLS (tls=true + CAFile) or without — both work
+#   * no client certificate is required (allowConnectionsWithoutCertificates: true)
+#   * requireTLS is NOT part of this change; it would break every app that has not moved to tls=true
+#
+# Guardrail G9: all three members end this run on the same TLS config — but they are restarted
+# ONE AT A TIME, waiting for each to be back in service. Restarting all three back-to-back would
+# take two members down at once, which costs the cluster its majority and turns a zero-downtime
+# change into an outage.
+#
+# CLIENT IMPACT, stated plainly (measured behaviour, not a guess): `preferTLS` uses TLS for
+# member-to-member traffic, so while only two of the three members have been restarted, those two
+# cannot apply new writes. `w:"majority"` writes then BLOCK — they do not fail, so retryWrites does
+# not rescue them — until the third member restarts (~2-5 min). Reads and w:1 writes are unaffected.
+# This is acceptable only if the app team has confirmed the write concern; if they run w:majority
+# without wtimeout, insert a planned 5-minute write pause before the mongo1/mongo2 restarts.
+# See EXECUTION-PROTOCOL.md "Window 3" for options A/B/C.
+#
+#   ansible-playbook playbooks/05-tls.yml -e change_ticket=CHG-xxxx -e confirm_window=YES
+#
+# `-e tls_mode=requireTLS` is reachable only with an explicit -e confirm_require_tls=YES, because
+# that is a different change with a different impact statement.
+- name: "05 | stage certificates and TLS config on all members (no restart)"
+  hosts: prod_live
+  gather_facts: false
+  # Every step below runs after the community packages are removed, and the legacy `mongo`
+  # binary belongs to them. Refuse to start unless mongosh is present (preflight-common.yml).
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "05 | window gate"
+      ansible.builtin.assert:
+        that:
+          - change_ticket is defined and change_ticket | length > 3
+          - confirm_window | default('') == 'YES'
+          - tls_mode | default('preferTLS') in ['preferTLS', 'requireTLS']
+          - tls_mode | default('preferTLS') == 'preferTLS' or confirm_require_tls | default('') == 'YES'
+        fail_msg: >-
+          Refusing to run. This change enables TLS in preferTLS mode (TLS and plaintext both accepted).
+          Pass -e change_ticket=CHG-xxxx -e confirm_window=YES. Enforcing requireTLS is a separate
+          change: it requires -e confirm_require_tls=YES and an app-side cutover first.
+        quiet: true
+
+    - name: "05 | this change's end state"
+      ansible.builtin.debug:
+        msg:
+          - "net.tls.mode = {{ tls_mode | default('preferTLS') }} on all three members"
+          - "{{ 'TLS and non-TLS client connections are BOTH accepted after this window.' if (tls_mode | default('preferTLS')) == 'preferTLS' else 'WARNING: requireTLS — plaintext clients will be rejected.' }}"
+      run_once: true
+
+    - name: "05 | the PKI must already exist on the control host (fails before touching a node)"
+      ansible.builtin.assert:
+        that:
+          - query('fileglob', tls_cert_src_dir ~ '/ca.crt') | length == 1
+          - query('fileglob', tls_cert_src_dir ~ '/*.pem') | length >= 3
+        fail_msg: >-
+          No PKI in {{ tls_cert_src_dir }}. Run scripts/issue-certs.sh on the control host first
+          (it writes ca.crt + one <member>.pem per node).
+        quiet: true
+      run_once: true
+
+    - name: "05 | identity, membership and health"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "05 | certificate directory"
+      ansible.builtin.file:
+        path: "{{ tls_dir }}"
+        state: directory
+        owner: mongod
+        group: mongod
+        mode: "0750"
+
+    - name: "05 | distribute the CA"
+      ansible.builtin.copy:
+        src: "{{ tls_cert_src_dir }}/ca.crt"
+        dest: "{{ tls_ca }}"
+        owner: mongod
+        group: mongod
+        mode: "0644"
+
+    - name: "05 | distribute the server certificate + key bundle"
+      ansible.builtin.copy:
+        src: "{{ tls_cert_src_dir }}/{{ inventory_hostname }}.pem"
+        dest: "{{ tls_cert }}"
+        owner: mongod
+        group: mongod
+        mode: "0600"
+      no_log: true
+
+    - name: "05 | the certificate must match this host (SAN = hostname and IP)"
+      ansible.builtin.command:
+        argv: [openssl, x509, -in, "{{ tls_cert }}", -noout, -checkhost, "{{ inventory_hostname }}"]
+      register: cert_host
+      changed_when: false
+      check_mode: false
+
+    - name: "05 | certificate identity gate"
+      ansible.builtin.assert:
+        that:
+          - "'does match' in cert_host.stdout"
+        fail_msg: >-
+          The certificate in {{ tls_cert }} on {{ inventory_hostname }} does not validate for
+          that hostname. Members would fail to authenticate each other.
+        quiet: true
+
+    - name: "05 | merge the net.tls block (config only — every member changes before any restart)"
+      ansible.builtin.include_tasks: ../tasks/merge-mongod-conf.yml
+      vars:
+        conf_label: "tls-{{ tls_mode }}"
+        conf_merge:
+          net:
+            tls:
+              mode: "{{ tls_mode }}"
+              certificateKeyFile: "{{ tls_cert }}"
+              CAFile: "{{ tls_ca }}"
+              allowConnectionsWithoutCertificates: "{{ (tls_mode == 'preferTLS') | ternary(true, false) }}"
+
+    # The TLS block is asserted per host against the intended values, NOT by comparing whole-file
+    # checksums across members: mongo1/mongo2 legitimately carry setParameter.initialSyncMethod
+    # from Phase 2 while mongo3 does not, so a cluster-wide md5 equality gate would fail for a
+    # correct configuration and block the window.
+    - name: "05 | re-read the written config"
+      ansible.builtin.slurp:
+        src: "{{ conf_file }}"
+      register: tls_conf_raw
+
+    - name: "05 | every member must carry exactly this net.tls block before the restart"
+      ansible.builtin.assert:
+        that:
+          - (tls_conf_raw.content | b64decode | from_yaml).net.tls.mode == (tls_mode | default('preferTLS'))
+          - (tls_conf_raw.content | b64decode | from_yaml).net.tls.certificateKeyFile == tls_cert
+          - (tls_conf_raw.content | b64decode | from_yaml).net.tls.CAFile == tls_ca
+          - ((tls_conf_raw.content | b64decode | from_yaml).net.tls.allowConnectionsWithoutCertificates | default(false) | bool)
+            == ((tls_mode | default('preferTLS')) == 'preferTLS')
+          # the rest of the config must have survived the rewrite
+          - (tls_conf_raw.content | b64decode | from_yaml).security.keyFile is defined
+          - (tls_conf_raw.content | b64decode | from_yaml).replication.replSetName == replset_name
+        fail_msg: >-
+          {{ inventory_hostname }} does not carry the intended TLS block. G9: never run members
+          with different net.tls states. Current net block:
+          {{ (tls_conf_raw.content | b64decode | from_yaml).net | default({}) }}
+        quiet: true
+
+# ── Activation: strictly one member at a time, primary last ───────────────────────
+- name: "05 | activate TLS — mongo3 (secondary)"
+  hosts: mongo3
+  gather_facts: false
+  # destructive: the legacy mongo binary is gone once the community packages go
+    # (see group_vars/all.yml and tasks/preflight-common.yml)
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "05 | mongo3 restart"
+      ansible.builtin.include_tasks: ../tasks/tls-activate-one.yml
+
+- name: "05 | activate TLS — mongo1 (secondary)"
+  hosts: mongo1
+  gather_facts: false
+  # destructive: the legacy mongo binary is gone once the community packages go
+    # (see group_vars/all.yml and tasks/preflight-common.yml)
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "05 | mongo1 restart"
+      ansible.builtin.include_tasks: ../tasks/tls-activate-one.yml
+
+- name: "05 | activate TLS — mongo2 (priority-2 primary, last)"
+  hosts: mongo2
+  gather_facts: false
+  # destructive: the legacy mongo binary is gone once the community packages go
+    # (see group_vars/all.yml and tasks/preflight-common.yml)
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "05 | mongo2 restart"
+      ansible.builtin.include_tasks: ../tasks/tls-activate-one.yml
+
+- name: "05 | verify TLS on every member"
+  hosts: prod_live
+  gather_facts: false
+  # Every step below runs after the community packages are removed, and the legacy `mongo`
+  # binary belongs to them. Refuse to start unless mongosh is present (preflight-common.yml).
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "05 | every member must be caught up now that all three are on TLS"
+      ansible.builtin.include_tasks: ../tasks/wait-member-synced.yml
+      vars:
+        max_lag_sec: 15
+        wait_retries: 120
+        wait_delay: 15
+
+    - name: "05 | TLS connect from the node itself"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--tls', '--tlsCAFile', tls_ca, '--eval', 'print(\"TLS-OK ' ~ inventory_hostname ~ '\")'] }}"
+      register: tls_probe
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: "05 | TLS must be the transport in use"
+      ansible.builtin.assert:
+        that:
+          - "'TLS-OK' in tls_probe.stdout"
+        fail_msg: "TLS connection failed on {{ inventory_hostname }}: {{ tls_probe.stderr | default('') | truncate(300) }}"
+        quiet: true
+
+    # ── The other half of the requirement: non-TLS must still work ────────────────
+    - name: "05 | PLAINTEXT connect from the node itself (must succeed in preferTLS)"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'print(\"PLAINTEXT-OK ' ~ inventory_hostname ~ '\")'] }}"
+      register: plaintext_probe
+      changed_when: false
+      check_mode: false
+      no_log: true
+      when: (tls_mode | default('preferTLS')) == 'preferTLS'
+
+    - name: "05 | both paths are required in preferTLS mode"
+      ansible.builtin.assert:
+        that:
+          - "'PLAINTEXT-OK' in plaintext_probe.stdout"
+        fail_msg: >-
+          Plaintext connections were rejected on {{ inventory_hostname }}
+          ({{ plaintext_probe.stderr | default('') | truncate(300) }}). The decision for this change is
+          TLS *and* non-TLS accepted — if this fails, the mode is not preferTLS and apps will break.
+        quiet: true
+      when: (tls_mode | default('preferTLS')) == 'preferTLS'
+
+    - name: "05 | transport security counters"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify(db.serverStatus().transportSecurity)'] }}"
+      register: transport
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: "05 | record the transport evidence"
+      ansible.builtin.copy:
+        dest: "{{ artifact_dir }}/tls-{{ now(fmt='%Y%m%d-%H%M%S') }}-{{ inventory_hostname }}.json"
+        mode: "0600"
+        content: |
+          {{ {'host': inventory_hostname, 'ip': ansible_host,
+              'configured_mode': tls_mode | default('preferTLS'),
+              'ca': tls_ca, 'cert': tls_cert,
+              'tls_probe': 'PASS',
+              'plaintext_probe': ('PASS' if (tls_mode | default('preferTLS')) == 'preferTLS' else 'not-applicable'),
+              'transport_security': transport.stdout | default('{}'),
+              'captured_at': now(fmt='%Y-%m-%dT%H:%M:%S')} | to_nice_json }}
+      delegate_to: localhost
+
+    - name: "05 | result"
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }}: mode={{ tls_mode | default('preferTLS') }}, TLS probe=PASS, plaintext probe={{ 'PASS' if (tls_mode | default('preferTLS')) == 'preferTLS' else 'n/a' }}"
+          - "transport={{ transport.stdout | default('{}') }}"
+          - "{{ 'End state reached: apps may use tls=true or plain http-style URIs; neither is broken.' if (tls_mode | default('preferTLS')) == 'preferTLS' else 'requireTLS active — plaintext is rejected.' }}"
+
+- name: "05 | close-out — exactly one primary, no member left behind"
+  hosts: prod_live
+  gather_facts: false
+  # Every step below runs after the community packages are removed, and the legacy `mongo`
+  # binary belongs to them. Refuse to start unless mongosh is present (preflight-common.yml).
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "05 | identity and health after the restarts"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "05 | the set must have exactly one writable primary"
+      ansible.builtin.assert:
+        that:
+          - mongo_rs_status.members | selectattr('state', 'equalto', 1) | list | length == 1
+        fail_msg: >-
+          The replica set has
+          {{ mongo_rs_status.members | selectattr('state', 'equalto', 1) | list | length }} primary
+          member(s). Leave the window open and investigate before handing back to the app team.
+        quiet: true
+      run_once: true

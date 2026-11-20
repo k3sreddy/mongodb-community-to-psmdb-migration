@@ -1,0 +1,290 @@
+---
+# 00 — Baseline (READ-ONLY). Safe to run at any time, including before the window.
+# Produces: topology/version/FCV/disk/config checksums + per-DB document fingerprint
+#           in artifacts/baseline-<stamp>.json  (this is the reference for 06-verify.yml,
+#           and the ONLY completeness proof in a migration with no backup)
+- name: "00 | LIVE pre-flight baseline (read-only)"
+  hosts: prod_live
+  gather_facts: true
+  tasks:
+    - name: "00 | identity, membership and health"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "00 | config and keyfile checksums"
+      ansible.builtin.command:
+        argv: [md5sum, "{{ conf_file }}", "{{ key_file }}"]
+      register: conf_md5
+      changed_when: false
+      check_mode: false
+
+    # The plan must be anchored to the RUNNING config, not to what the plan assumes. Every path
+    # in this change (dbPath for the wipe, replSetName for the gates, keyFile for the backup and
+    # restore) is taken from these variables; if they disagree with /etc/mongod.conf the run is
+    # built on a false assumption. Verified drift on 2026-11-19: the real keyFile was
+    # /etc/mongodb/keyFiles/mongo-key, not the /etc/mongod.key the plan originally named.
+    - name: "00 | read the running config"
+      ansible.builtin.slurp:
+        src: "{{ conf_file }}"
+      register: conf_raw
+
+    - name: "00 | parse the running config"
+      ansible.builtin.set_fact:
+        conf_running: "{{ conf_raw.content | b64decode | from_yaml }}"
+
+    - name: "00 | the running config must match the cluster facts this plan is built on"
+      ansible.builtin.assert:
+        that:
+          - conf_running.storage.dbPath == db_path
+          - conf_running.replication.replSetName == replset_name
+          - conf_running.net.port | int == mongo_port | int
+          - conf_running.security.authorization | default('') == 'enabled'
+          - conf_running.security.keyFile | default('') | trim == key_file
+        fail_msg: >-
+          {{ inventory_hostname }}: /etc/mongod.conf does not match this plan.
+          dbPath={{ conf_running.storage.dbPath | default('?') }} (plan: {{ db_path }}),
+          replSetName={{ conf_running.replication.replSetName | default('?') }} (plan: {{ replset_name }}),
+          port={{ conf_running.net.port | default('?') }} (plan: {{ mongo_port }}),
+          keyFile={{ conf_running.security.keyFile | default('none') | trim }} (plan: {{ key_file }}),
+          authorization={{ conf_running.security.authorization | default('none') }}.
+          Reconcile group_vars before any window — the wipe path and every gate depend on these.
+        quiet: true
+
+    - name: "00 | keyfile must exist with restrictive permissions"
+      ansible.builtin.stat:
+        path: "{{ key_file }}"
+      register: keyfile_stat
+
+    - name: "00 | keyfile gate"
+      ansible.builtin.assert:
+        that:
+          - keyfile_stat.stat.exists
+          - keyfile_stat.stat.mode in ['0400', '0600']
+          - keyfile_stat.stat.pw_name in ['mongod', 'root']
+        fail_msg: >-
+          {{ key_file }} on {{ inventory_hostname }}: exists={{ keyfile_stat.stat.exists }},
+          mode={{ keyfile_stat.stat.mode | default('?') }},
+          owner={{ keyfile_stat.stat.pw_name | default('?') }}. A group/world-readable keyfile makes
+          mongod refuse to start the set, and node-upgrade.yml stages this file for rollback.
+        quiet: true
+
+    # NOTE: never put a comma inside an unquoted flow-sequence element here. YAML splits
+    # `-o SOURCE,TARGET,FSTYPE` into THREE argv elements and findmnt then exits 1 with
+    # "options --target and --source can't be used together with command line element that is
+    # not an option". The default column set already contains TARGET/SOURCE/FSTYPE.
+    - name: "00 | NFS share must be mounted (it holds the encryption-key DR copy)"
+      ansible.builtin.command:
+        argv: [findmnt, -n, -T, "{{ nfs_backup_dir }}"]
+      register: nfs_mount
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: "00 | NFS gate"
+      ansible.builtin.assert:
+        that:
+          - nfs_mount.rc == 0
+          - nfs_mount.stdout | trim | length > 0
+          - nfs_mount.stdout is search('nfs')
+          - nfs_mount.stdout is search(nfs_backup_dir)
+        fail_msg: >-
+          {{ nfs_backup_dir }} is not an NFS mount on {{ inventory_hostname }}
+          ({{ nfs_mount.stdout | default('') | trim | default('no output', true) }}).
+          It is required for the encryption-key DR copy — with no data backup, losing the key
+          means losing the data.
+        quiet: true
+
+    # `df -B1 <path>` with the DEFAULT columns, for the same reason: `--output=avail,size`
+    # would be split by YAML into `--output=avail` and `size`, and df would then stat a file
+    # called "size". Default columns are: Filesystem 1B-blocks Used Available Use% Mounted-on
+    #   -> [0]=fs [1]=size [2]=used [3]=avail [4]=use% [5]=mount
+    - name: "00 | free space on the data volume and on the NFS share"
+      ansible.builtin.command:
+        argv: [df, -B1, "{{ item }}"]
+      register: df_space
+      changed_when: false
+      check_mode: false
+      loop:
+        - "{{ data_mount }}"
+        - "{{ nfs_backup_dir }}"
+
+    - name: "00 | capacity gates (percentage AND absolute floor on /DATA)"
+      ansible.builtin.set_fact:
+        data_size_bytes: "{{ df_space.results[0].stdout_lines[1].split()[1] | int }}"
+        data_avail_bytes: "{{ df_space.results[0].stdout_lines[1].split()[3] | int }}"
+        nfs_avail_bytes: "{{ df_space.results[1].stdout_lines[1].split()[3] | int }}"
+
+    - name: "00 | capacity gate"
+      ansible.builtin.assert:
+        that:
+          - data_avail_bytes > (min_data_free_gb | int) * 1073741824
+          - (data_avail_bytes * 100 / data_size_bytes) >= (min_data_free_pct | int)
+          - nfs_avail_bytes > (min_nfs_free_gb | int) * 1073741824
+        fail_msg: >-
+          {{ data_mount }} has {{ (data_avail_bytes / 1073741824) | round(1) }} GB free of
+          {{ (data_size_bytes / 1073741824) | round(1) }} GB
+          ({{ (data_avail_bytes * 100 / data_size_bytes) | round(1) }}%).
+          A wipe + resync needs >= {{ min_data_free_pct }}% and >= {{ min_data_free_gb }} GB.
+          NFS free: {{ (nfs_avail_bytes / 1073741824) | round(1) }} GB
+          (needs > {{ min_nfs_free_gb }} GB for the key DR copy).
+        quiet: true
+
+    - name: "00 | document-count fingerprint (secondaries only — never load the primary)"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', fingerprint_js] }}"
+      register: fingerprint
+      changed_when: false
+      check_mode: false
+      no_log: true
+      when: not (mongo_hello.isWritablePrimary | default(true))
+
+    - name: "00 | installed mongo packages"
+      ansible.builtin.command: rpm -qa
+      register: rpm_all
+      changed_when: false
+      check_mode: false
+
+- name: "00 | archive the baseline on the control host"
+  hosts: localhost
+  gather_facts: false
+  # The implicit localhost host is only in group 'all', so group_vars/prod_live/ never reaches
+  # this play. Cluster identity, the fingerprint tolerance and the artifact paths all live there,
+  # so they are loaded explicitly. Without this the tolerance/report tasks fail with
+  # "'fingerprint_max_rel_pct' is undefined" — measured 2026-11-19.
+  vars_files:
+    - "{{ playbook_dir }}/../inventory/group_vars/prod_live/main.yml"
+  tasks:
+    - name: "00 | ensure artifact directory"
+      ansible.builtin.file:
+        path: "{{ artifact_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: "00 | collect per-host baseline records"
+      ansible.builtin.set_fact:
+        baseline_hosts: >-
+          {{ (baseline_hosts | default([])) + [{
+            'host': item,
+            'ip': hostvars[item].ansible_host,
+            'role': (hostvars[item].mongo_hello.isWritablePrimary | default(false)) | ternary('PRIMARY', 'SECONDARY'),
+            'version': hostvars[item].mongo_build.version,
+            'psmdb': hostvars[item].mongo_build.psmdbVersion | default('none (community build)'),
+            'fcv': hostvars[item].mongo_fcv,
+            'config_md5': hostvars[item].conf_md5.stdout_lines | join(' | '),
+            'disk_free_bytes': hostvars[item].data_avail_bytes | int,
+            'nfs_mount': hostvars[item].nfs_mount.stdout | trim,
+            'packages': (hostvars[item].rpm_all.stdout_lines | select('search', 'mongo') | list)
+          }] }}
+      loop: "{{ groups['prod_live'] }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "00 | list hosts with a fingerprint"
+      ansible.builtin.set_fact:
+        # NOT `selectattr('fingerprint','defined')`: a task that is SKIPPED still registers its
+        # variable ({"skipped": true, ...}), so `is defined` is true for the PRIMARY too and the
+        # from_json below would explode on a missing .stdout. Filter on .stdout being present.
+        fp_hosts: >-
+          {{ groups['prod_live'] | map('extract', hostvars) | selectattr('fingerprint', 'defined')
+             | selectattr('fingerprint.stdout', 'defined')
+             | map(attribute='inventory_hostname') | list }}
+
+    - name: "00 | collect fingerprint totals and per-database maps"
+      ansible.builtin.set_fact:
+        fp_totals: >-
+          {{ fp_hosts | map('extract', hostvars, ['fingerprint', 'stdout']) | map('from_json')
+             | map(attribute='total') | list }}
+        fp_perdb: >-
+          {{ fp_hosts | map('extract', hostvars, ['fingerprint', 'stdout']) | map('from_json')
+             | map(attribute='perDb') | list }}
+
+    # `keys` is not a filter in ansible-core 2.22 — `map('keys')` fails at runtime with
+    # "No filter named 'keys'". dictsort gives sorted (name, count) pairs, so taking attribute 0
+    # of each pair is the portable way to get a member's database-name set.
+    - name: "00 | collect the database-name sets from each secondary"
+      ansible.builtin.set_fact:
+        fp_dbsets: >-
+          {{ fp_perdb | map('dictsort') | map('map', attribute=0) | map('list')
+             | map('sort') | map('to_json') | list }}
+        fp_dbnames: >-
+          {{ fp_perdb | map('dictsort') | map('map', attribute=0) | flatten | unique | sort | list }}
+
+    # Exact equality is NOT a valid gate on a live cluster: writes land between two members'
+    # samples. Measured 2026-11-19 — both secondaries healthy and in sync, totals 1,169,656,301
+    # vs 1,169,646,605 (9,696 apart, 8 ppm). What must hold is (a) the same databases exist on
+    # every member, and (b) the totals agree within the configured tolerance. "Is a member
+    # behind" is answered by replication optime lag, which every play asserts separately.
+    - name: "00 | the same databases must exist on every sampled secondary"
+      ansible.builtin.assert:
+        that:
+          - fp_hosts | length >= 1
+          - fp_dbsets | unique | length == 1
+        fail_msg: >-
+          Secondaries expose different database sets ({{ fp_dbsets }}).
+          A database present on one member and absent on another is a replication fault.
+        quiet: true
+
+    - name: "00 | compute the fingerprint spread against the tolerance"
+      ansible.builtin.set_fact:
+        fp_delta: "{{ (fp_totals | max | int) - (fp_totals | min | int) }}"
+        fp_tolerance: >-
+          {{ [fingerprint_max_abs_delta | int,
+              (((fp_totals | min | int) * (fingerprint_max_rel_pct | float)) / 100) | int] | max }}
+
+    - name: "00 | fingerprints must agree within tolerance"
+      ansible.builtin.assert:
+        that:
+          - fp_delta | int <= fp_tolerance | int
+        fail_msg: >-
+          Secondary fingerprint spread is {{ fp_delta }}, tolerance {{ fp_tolerance }}
+          (totals {{ fp_totals }}, hosts {{ fp_hosts }}). At this size that is a real divergence,
+          not write traffic. Replication is inconsistent — do not migrate.
+        quiet: true
+
+    # Totals alone are too coarse: 0.05% of this cluster is 585k documents, so losing a 300k-document
+    # collection would still pass on totals. The floor here is sized from measured noise (37,229 docs
+    # in one database between two consecutive samples on the SAME member). Every database is therefore compared
+    # separately. The database-name SET was asserted identical above, so `map(attribute=item)`
+    # cannot miss a key here; if that ever changes, this task fails loudly rather than silently
+    # comparing fewer databases.
+    - name: "00 | per-database fingerprints must be within tolerance"
+      ansible.builtin.assert:
+        that:
+          - _db_delta | int <= _db_tolerance | int
+        fail_msg: >-
+          Database '{{ item }}' differs by {{ _db_delta }} documents across members
+          ({{ _counts }}), tolerance {{ _db_tolerance }}. That is a real divergence inside one
+          database, not write traffic — do not migrate.
+        quiet: true
+      vars:
+        _counts: "{{ fp_perdb | map(attribute=item) | map('int') | list }}"
+        _db_delta: "{{ (_counts | max) - (_counts | min) }}"
+        _db_tolerance: >-
+          {{ [fingerprint_db_max_abs_delta | int,
+              (((_counts | min | int) * (fingerprint_db_max_rel_pct | float)) / 100) | int] | max }}
+      loop: "{{ fp_dbnames }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "00 | write baseline artifact"
+      ansible.builtin.copy:
+        dest: "{{ artifact_dir }}/baseline-{{ now(fmt='%Y%m%d-%H%M%S') }}.json"
+        mode: "0600"
+        content: |
+          {{ {
+            'cluster': cluster_id,
+            'label': cluster_label,
+            'replica_set': replset_name,
+            'captured_at': now(fmt='%Y-%m-%dT%H:%M:%S'),
+            'hosts': baseline_hosts,
+            'fingerprint_hosts': fp_hosts,
+            'fingerprint_total': (hostvars[fp_hosts[0]].fingerprint.stdout | from_json).total,
+            'fingerprint_per_db': (hostvars[fp_hosts[0]].fingerprint.stdout | from_json).perDb
+          } | to_nice_json }}
+
+    - name: "00 | summary"
+      ansible.builtin.debug:
+        msg:
+          - "Baseline written to {{ artifact_dir }}/baseline-*.json"
+          - "Fingerprint total: {{ (hostvars[fp_hosts[0]].fingerprint.stdout | from_json).total }} documents ({{ fp_hosts | join(', ') }})"
+          - "Roles: {{ baseline_hosts | map(attribute='host') | zip(baseline_hosts | map(attribute='role')) | map('join', '=') | join(', ') }}"
+          - "This file is the completeness reference for every Phase-2 resync — regenerate it in W1, not from an old run."

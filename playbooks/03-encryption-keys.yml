@@ -1,0 +1,178 @@
+---
+# 03 — Shared at-rest encryption key for this cluster (no restarts, no data touched).
+# Keys are installed on all three members but the encryption block is added to mongod.conf
+# per-leg in 04 (deviation from the reference-cluster runbook, deliberately: an up-front block makes a
+# node unstartable if it reboots before its own leg — see README §11).
+- name: "03 | decide the key of record"
+  hosts: prod_live
+  gather_facts: false
+  # Every step below runs after the community packages are removed, and the legacy `mongo`
+  # binary belongs to them. Refuse to start unless mongosh is present (preflight-common.yml).
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "03 | window gate"
+      ansible.builtin.assert:
+        that:
+          - change_ticket is defined and change_ticket | length > 3
+          - confirm_window | default('') == 'YES'
+        fail_msg: "Refusing to run. Pass -e change_ticket=CHG-xxxx -e confirm_window=YES."
+        quiet: true
+
+    - name: "03 | identity and health"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "03 | is a key already installed?"
+      ansible.builtin.stat:
+        path: "{{ encryption_key_file }}"
+      register: enc_key_stat
+
+    - name: "03 | ensure the control-host artifact directory"
+      ansible.builtin.file:
+        path: "{{ artifact_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      run_once: true
+
+    - name: "03 | count how many members already have a key"
+      ansible.builtin.set_fact:
+        key_present_count: >-
+          {{ groups['prod_live'] | map('extract', hostvars, ['enc_key_stat', 'stat', 'exists']) | list
+             | select('equalto', true) | list | length }}
+
+    - name: "03 | all-or-nothing key state must be resolved before generating anything"
+      ansible.builtin.assert:
+        that:
+          - key_present_count | int in [0, 3]
+        fail_msg: >-
+          The encryption key exists on {{ key_present_count }} of 3 members. A partially
+          installed key is worse than none — resolve it by hand before proceeding.
+        quiet: true
+      run_once: true
+
+    - name: "03 | hash any key that is already installed"
+      ansible.builtin.command:
+        argv: [sha256sum, "{{ encryption_key_file }}"]
+      register: existing_key_sha
+      changed_when: false
+      check_mode: false
+      no_log: true
+      when: enc_key_stat.stat.exists
+
+    # If this cluster is already encrypted, a differing key on one member means that member's
+    # data belongs to a different key. Copying group[0]'s key over it would destroy access.
+    - name: "03 | an existing key set must already agree before it is adopted"
+      ansible.builtin.assert:
+        that:
+          - (groups['prod_live'] | map('extract', hostvars, ['existing_key_sha', 'stdout']) | map('regex_replace', ' .*$', '') | unique | list | length) == 1
+        fail_msg: >-
+          The {{ key_present_count }} installed encryption keys do not match. Overwriting them
+          would make data encrypted under the other key unreadable. Stop and determine which key
+          owns the data before proceeding.
+        quiet: true
+      run_once: true
+      when: key_present_count | int == 3
+
+    - name: "03 | adopt the existing key (re-run safety)"
+      ansible.builtin.fetch:
+        src: "{{ encryption_key_file }}"
+        dest: "{{ artifact_dir }}/mongo-enc.key"
+        flat: true
+      delegate_to: "{{ groups['prod_live'][0] }}"
+      when: hostvars[groups['prod_live'][0]].enc_key_stat.stat.exists
+      run_once: true
+      no_log: true
+
+    - name: "03 | generate a new key of record (raw 32 bytes — hex text is rejected by PSMDB)"
+      ansible.builtin.command:
+        argv: [openssl, rand, -out, "{{ artifact_dir }}/mongo-enc.key", "{{ encryption_key_bytes }}"]
+      args:
+        creates: "{{ artifact_dir }}/mongo-enc.key"
+      delegate_to: localhost
+      when: not hostvars[groups['prod_live'][0]].enc_key_stat.stat.exists
+      run_once: true
+      no_log: true
+
+    - name: "03 | key of record must be exactly {{ encryption_key_bytes }} bytes"
+      ansible.builtin.stat:
+        path: "{{ artifact_dir }}/mongo-enc.key"
+      register: key_of_record
+      delegate_to: localhost
+      run_once: true
+
+    - name: "03 | key format gate (guardrail G11)"
+      ansible.builtin.assert:
+        that:
+          - key_of_record.stat.exists
+          - key_of_record.stat.size | int == encryption_key_bytes | int
+        fail_msg: >-
+          {{ artifact_dir }}/mongo-enc.key is {{ key_of_record.stat.size | default('missing') }} bytes.
+          Percona TDE requires RAW {{ encryption_key_bytes }} bytes; a 64-char hex string is the
+          classic mistake (it fails at startup, after the wipe).
+        quiet: true
+      run_once: true
+
+- name: "03 | distribute the key and record DR copies"
+  hosts: prod_live
+  gather_facts: false
+  # Every step below runs after the community packages are removed, and the legacy `mongo`
+  # binary belongs to them. Refuse to start unless mongosh is present (preflight-common.yml).
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "03 | install key on {{ inventory_hostname }}"
+      ansible.builtin.copy:
+        src: "{{ artifact_dir }}/mongo-enc.key"
+        dest: "{{ encryption_key_file }}"
+        owner: mongod
+        group: mongod
+        mode: "0600"
+      no_log: true
+
+    - name: "03 | key hashes must be identical on every member"
+      ansible.builtin.command:
+        argv: [sha256sum, "{{ encryption_key_file }}"]
+      register: key_sha
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: "03 | hash equality (a divergent key means divergent data later)"
+      ansible.builtin.assert:
+        that:
+          - (groups['prod_live'] | map('extract', hostvars, ['key_sha', 'stdout']) | map('regex_replace', ' .*$', '') | unique | list | length) == 1
+        fail_msg: "Encryption key hashes differ across members. Stop and fix before any wipe."
+        quiet: true
+      run_once: true
+
+    - name: "03 | DR copy of the key on the NFS share"
+      ansible.builtin.copy:
+        src: "{{ artifact_dir }}/mongo-enc.key"
+        dest: "{{ backup_dir }}/keys/{{ cluster_id }}-mongo-enc.key"
+        mode: "0600"
+        directory_mode: "0700"
+      delegate_to: "{{ groups['prod_live'][0] }}"
+      run_once: true
+      no_log: true
+
+    - name: "03 | DR hash record (recovery is impossible without this key)"
+      ansible.builtin.copy:
+        dest: "{{ artifact_dir }}/encryption-key-hash.txt"
+        mode: "0600"
+        content: |
+          cluster: {{ cluster_id }} ({{ replset_name }})
+          key_path: {{ encryption_key_file }}
+          key_bytes: {{ encryption_key_bytes }}
+          cipher: {{ encryption_cipher }}
+          sha256: {{ hostvars[groups['prod_live'][0]].key_sha.stdout }}
+          dr_copies: 3 nodes ({{ encryption_key_file }}) + NFS {{ backup_dir }}/keys/ + control host {{ artifact_dir }}/mongo-enc.key
+          recorded_at: {{ now(fmt='%Y-%m-%dT%H:%M:%S') }}
+          WARNING: losing this key = losing the data. Back it up off-box, separately from the data backups.
+      delegate_to: localhost
+      run_once: true
+
+    - name: "03 | key hash"
+      ansible.builtin.debug:
+        msg: "Encryption key installed and identical on all 3 members: {{ hostvars[groups['prod_live'][0]].key_sha.stdout }}"
+      run_once: true

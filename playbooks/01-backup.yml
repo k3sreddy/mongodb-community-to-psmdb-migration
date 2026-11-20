@@ -1,0 +1,150 @@
+---
+# 01 — OPTIONAL / NOT PART OF THIS CHANGE.
+# Ops decision (2026-11): the LIVE cluster is migrated WITHOUT a logical backup, same as the
+# the reference cluster migration. This play is therefore NOT imported by playbooks/site.yml — it runs only when
+# invoked directly. It is kept because the cluster still has no verified backup of any kind and
+# this is the only tested dump path we have.
+#
+#   ansible-playbook playbooks/01-backup.yml -e change_ticket=CHG-xxxx -e confirm_backup=YES
+#
+# Removing the backup does NOT remove the need for the compensating controls in
+# EXECUTION-PROTOCOL.md §2A — read that before touching Phase 2.
+- name: "01 | Full backup to NFS (optional, not part of this change)"
+  hosts: prod_live
+  gather_facts: false
+  vars:
+    backup_source: "{{ backup_source_host | default('mongo3') }}"
+    backup_stamp: "{{ now(fmt='%Y%m%d') }}"
+    backup_archive: "{{ backup_dir }}/prod-live-full-{{ backup_stamp }}.archive.gz"
+  tasks:
+    - name: "01 | gate"
+      ansible.builtin.assert:
+        that:
+          - change_ticket is defined and change_ticket | length > 3
+          - confirm_backup | default('') == 'YES'
+        fail_msg: >-
+          Refusing to run. This playbook is gated; it needs an approved change record
+          (-e change_ticket=CHG-xxxx) and an explicit confirmation (-e confirm_backup=YES)
+          passed inside the approved window (README §5, gate G-A).
+        quiet: true
+
+    - name: "01 | change record"
+      ansible.builtin.debug:
+        msg: "Running under change {{ change_ticket }} — {{ cluster_label }} ({{ replset_name }})"
+      run_once: true
+
+    # Everything below runs on the backup source only; the other members are skipped,
+    # never touched.
+    - name: "01 | backup on {{ backup_source }}"
+      when: inventory_hostname == backup_source
+      block:
+        - name: "01 | pre-flight identity and health"
+          ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+        - name: "01 | never dump the primary"
+          ansible.builtin.assert:
+            that:
+              # fail closed: unknown role = assume primary = refuse to dump from it
+              - not (mongo_hello.isWritablePrimary | default(true))
+            fail_msg: >-
+              {{ inventory_hostname }} is the PRIMARY. Point backup_source_host at a
+              secondary — dumping the only writable node adds avoidable load.
+            quiet: true
+
+        - name: "01 | NFS share and free space"
+          ansible.builtin.command:
+            argv: [df, --output=avail, -B1, "{{ backup_dir }}"]
+          register: nfs_free
+          changed_when: false
+          check_mode: false
+
+        - name: "01 | free space gate"
+          ansible.builtin.assert:
+            that:
+              - (nfs_free.stdout_lines[1] | int) > (min_nfs_backup_free_gb | int) * 1073741824
+            fail_msg: "NFS share has less than {{ min_nfs_backup_free_gb }} GB free."
+            quiet: true
+
+        - name: "01 | ensure backup directory exists"
+          ansible.builtin.file:
+            path: "{{ backup_dir }}"
+            state: directory
+            mode: "0750"
+
+        - name: "01 | mongodump (async — expect 2–4 h for ~0.8 TB)"
+          ansible.builtin.command:
+            argv:
+              - mongodump
+              - "--uri=mongodb://{{ mongo_admin_user }}:{{ mongo_admin_password }}@127.0.0.1:{{ mongo_port }}/?authSource={{ mongo_auth_db }}"
+              - --gzip
+              - "--archive={{ backup_archive }}"
+              - --numParallelCollections=8
+          async: 28800
+          poll: 60
+          register: dump
+          changed_when: true
+          no_log: true
+
+        - name: "01 | archive stats"
+          ansible.builtin.stat:
+            path: "{{ backup_archive }}"
+          register: archive_stat
+
+        - name: "01 | size gate"
+          ansible.builtin.assert:
+            that:
+              - archive_stat.stat.exists
+              - archive_stat.stat.size > 10737418240     # 10 GiB floor for a 0.8 TB dataset
+            fail_msg: "Backup archive missing or implausibly small — do NOT continue to any window step."
+            quiet: true
+
+        - name: "01 | restore dry-run (the backup is worthless until proven readable)"
+          ansible.builtin.command:
+            argv:
+              - mongorestore
+              - --gzip
+              - "--archive={{ backup_archive }}"
+              - --dryRun
+              - --quiet
+          async: 14400
+          poll: 60
+          register: dryrun
+          changed_when: false
+          no_log: true
+
+        - name: "01 | dry-run must pass"
+          ansible.builtin.assert:
+            that:
+              - dryrun.rc == 0
+            fail_msg: >-
+              mongorestore --dryRun failed on {{ backup_archive }}. Do not start the
+              migration. Output: {{ dryrun.stderr | default('') | truncate(400) }}
+            quiet: true
+
+        - name: "01 | checksum"
+          ansible.builtin.shell: sha256sum {{ backup_archive }} | tee {{ backup_archive }}.sha256
+          register: archive_sha
+          changed_when: true
+
+        - name: "01 | manifest to the control host"
+          ansible.builtin.copy:
+            dest: "{{ artifact_dir }}/backup-{{ backup_stamp }}-manifest.txt"
+            mode: "0600"
+            content: |
+              cluster: {{ cluster_id }} ({{ replset_name }})
+              change: {{ change_ticket }}
+              host: {{ inventory_hostname }} ({{ ansible_host }})
+              archive: {{ backup_archive }}
+              size_bytes: {{ archive_stat.stat.size }}
+              sha256: {{ archive_sha.stdout }}
+              dryrun: PASS
+              created_at: {{ now(fmt='%Y-%m-%dT%H:%M:%S') }}
+              restore_decision_required: "G-C — two senior engineers must sign off before Phase 2"
+          delegate_to: localhost
+
+        - name: "01 | result"
+          ansible.builtin.debug:
+            msg:
+              - "Backup OK: {{ backup_archive }} ({{ (archive_stat.stat.size / 1073741824) | round(1) }} GiB)"
+              - "sha256: {{ archive_sha.stdout }}"
+              - "Manifest: {{ artifact_dir }}/backup-{{ backup_stamp }}-manifest.txt"

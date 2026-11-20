@@ -1,0 +1,76 @@
+---
+# Restart ONE member into the staged TLS config and wait until it is back in service.
+# Called from 05-tls.yml once per member, in a fixed order (secondaries first, primary last),
+# so a 3-member set never has two members down at the same time.
+- name: "TLS | {{ inventory_hostname }} | is this member the primary right now?"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify({p:db.hello().isWritablePrimary})'] }}"
+  register: tls_role_before
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: "TLS | {{ inventory_hostname }} | graceful stepDown before its own restart (guardrail G2)"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'rs.stepDown(120)'] }}"
+  register: tls_stepdown
+  when: (tls_role_before.stdout | from_json).p | default(false)
+  changed_when: true
+  check_mode: false
+  no_log: true
+  failed_when: false
+
+- name: "TLS | {{ inventory_hostname }} | the stepDown must actually have taken effect"
+  ansible.builtin.assert:
+    that:
+      - tls_stepdown.rc is defined
+      - tls_stepdown.rc | int == 0
+    fail_msg: >-
+      rs.stepDown(120) failed on {{ inventory_hostname }}
+      (rc={{ tls_stepdown.rc | default('?') }}, {{ tls_stepdown.stderr | default('') | truncate(200) }}).
+      STOP — restarting a member while it still believes it is primary is an outage. The
+      'no new primary' check below would otherwise mask this as a mysterious election failure.
+    quiet: true
+  when: (tls_role_before.stdout | from_json).p | default(false)
+
+- name: "TLS | {{ inventory_hostname }} | a peer must have taken over before this member is restarted"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval',
+              'const st=rs.status();JSON.stringify({me:st.members.filter(m=>m.self)[0].state,primaries:st.members.filter(m=>m.state===1).length})'] }}"
+  register: tls_handover
+  changed_when: false
+  check_mode: false
+  no_log: true
+  until:
+    - (tls_handover.stdout | from_json).me == 2
+    - (tls_handover.stdout | from_json).primaries == 1
+  retries: 12
+  delay: 5
+  failed_when: false
+  when: (tls_role_before.stdout | from_json).p | default(false)
+
+- name: "TLS | {{ inventory_hostname }} | abort if no new primary was elected"
+  ansible.builtin.assert:
+    that:
+      - (tls_handover.stdout | from_json).me == 2
+      - (tls_handover.stdout | from_json).primaries == 1
+    fail_msg: >-
+      No new PRIMARY was elected after stepDown on {{ inventory_hostname }}
+      ({{ tls_handover.stdout | default('no output') }}). STOP — touch nothing. Restarting a
+      member of a set that has no primary is an outage.
+    quiet: true
+  when: (tls_role_before.stdout | from_json).p | default(false)
+
+- name: "TLS | {{ inventory_hostname }} | restart into the staged TLS config"
+  ansible.builtin.systemd:
+    name: mongod
+    state: restarted
+
+# Accept PRIMARY or SECONDARY: the priority-2 member re-elects itself within seconds of
+# finishing its recovery, and a hard "must be SECONDARY" here is a race we would lose.
+# Replication lag is deliberately NOT gated here — see the skip_lag_check note in
+# wait-member-synced.yml. Catch-up is asserted once all three members are on the new config.
+- name: "TLS | {{ inventory_hostname }} | back in service before the next member moves"
+  ansible.builtin.include_tasks: wait-member-synced.yml
+  vars:
+    skip_lag_check: true

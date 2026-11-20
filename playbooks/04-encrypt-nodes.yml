@@ -1,0 +1,213 @@
+---
+# 04 — At-rest encryption via wipe + resync. DESTRUCTIVE. Serial by construction:
+# each play is one node, in the order proved out on the reference cluster
+#   mongo3 (LOGICAL — the only node that pays the index rebuild)
+#   mongo1 (FCBIS from mongo3)
+#   mongo2 (FCBIS from mongo3, primary: stepDown first — the only client-visible event)
+#
+#   ansible-playbook playbooks/04-encrypt-nodes.yml \
+#       -e confirm_window=YES -e confirm_wipe=WIPE
+#
+# Requires 03-encryption-keys.yml to have run (key on all 3, identical hash).
+
+- name: "04 | Phase 2 pre-conditions (Phase 1 complete, key in place, no-backup acceptance)"
+  hosts: prod_live
+  gather_facts: false
+  # Every step below runs after the community packages are removed, and the legacy `mongo`
+  # binary belongs to them. Refuse to start unless mongosh is present (preflight-common.yml).
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "04 | window gate"
+      ansible.builtin.assert:
+        that:
+          - change_ticket is defined and change_ticket | length > 3
+          - confirm_window | default('') == 'YES'
+          - confirm_wipe | default('') == 'WIPE'
+        fail_msg: >-
+          Refusing to run. Phase 2 wipes data directories. Requires an approved change
+          (-e change_ticket=CHG-xxxx), -e confirm_window=YES -e confirm_wipe=WIPE AND the
+          signed no-backup acceptance (gate G-C, EXECUTION-PROTOCOL.md §2A).
+        quiet: true
+      run_once: true
+
+    - name: "04 | identity, membership and health"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    # The leg order below is hard-coded (mongo3 → mongo1 → mongo2) and leg 3 depends on mongo2
+    # being the primary it steps down. If the topology has moved, stop before any wipe.
+    - name: "04 | the encoded leg order assumes mongo2 is the primary"
+      ansible.builtin.assert:
+        that:
+          - hostvars['mongo2'].mongo_hello.isWritablePrimary | default(false)
+        fail_msg: >-
+          mongo2 is not the primary. Current writable flags:
+          {{ dict(groups['prod_live'] | zip(groups['prod_live'] | map('extract', hostvars, ['mongo_hello', 'isWritablePrimary']))) }}.
+          The leg order in encrypt_sequence assumes mongo2 is primary and steps it down last.
+          Re-plan the order before wiping anything.
+        quiet: true
+      run_once: true
+
+    - name: "04 | Phase 1 must be complete before any wipe"
+      ansible.builtin.assert:
+        that:
+          - mongo_build.version is search('^' ~ (target_major | regex_escape))
+          - mongo_fcv | string is search('^' ~ (target_major | regex_escape))
+        fail_msg: >-
+          {{ inventory_hostname }} is version={{ mongo_build.version }} fcv={{ mongo_fcv }}.
+          Finish the 8.0 upgrade (02) before encrypting — the wipe is not a substitute for it.
+        quiet: true
+
+    - name: "04 | encryption key must be present and identical on every member"
+      ansible.builtin.command:
+        argv: [sha256sum, "{{ encryption_key_file }}"]
+      register: key_sha
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: "04 | key hash equality (guardrail G11)"
+      ansible.builtin.assert:
+        that:
+          - (groups['prod_live'] | map('extract', hostvars, ['key_sha', 'stdout']) | map('regex_replace', ' .*$', '') | unique | list | length) == 1
+        fail_msg: "Key hashes differ across members — run 03 first, then re-check."
+        quiet: true
+      run_once: true
+
+    # NO BACKUP (ops decision). The fingerprint is now the only proof that a wipe+resync
+    # produced a complete dataset, so the Phase-0 baseline becomes a hard prerequisite.
+    - name: "04 | locate the Phase-0 fingerprint baseline"
+      ansible.builtin.set_fact:
+        baseline_files: "{{ query('fileglob', artifact_dir ~ '/baseline-*.json') | sort }}"
+
+    - name: "04 | the Phase-0 baseline is mandatory in a backup-less migration"
+      ansible.builtin.assert:
+        that:
+          - baseline_files | length > 0
+        fail_msg: >-
+          No fingerprint baseline in {{ artifact_dir }}. This cluster is being migrated without a
+          backup: the per-DB document fingerprint is the only thing that can prove a resynced node
+          is complete. Run 00-preflight.yml first (it is part of W1 and read-only).
+        quiet: true
+      run_once: true
+
+    - name: "04 | load the baseline total"
+      ansible.builtin.set_fact:
+        baseline_fp_file: "{{ baseline_files | last }}"
+        baseline_fp_total: "{{ (lookup('file', baseline_files | last) | from_json).fingerprint_total }}"
+
+    # The legs compare every resynced node against this number. If it were absent or zero the
+    # comparison would pass trivially, so refuse to wipe anything with an unusable baseline.
+    - name: "04 | the baseline count must be real before any node is wiped"
+      ansible.builtin.assert:
+        that:
+          - baseline_fp_total is defined
+          - (baseline_fp_total | int) > 0
+        fail_msg: >-
+          The baseline file {{ baseline_fp_file | default('(none)') }} has no usable
+          fingerprint_total ({{ baseline_fp_total | default('undefined') }}). Re-run
+          00-preflight.yml in this window before Phase 2 — the legs cannot prove completeness
+          against this value.
+        quiet: true
+      run_once: true
+
+    - name: "04 | pre-wipe state of the set (with no backup, these gates are the rollback plan)"
+      ansible.builtin.debug:
+        msg:
+          - "Baseline {{ baseline_fp_total }} docs ({{ baseline_fp_file }})"
+          - "Sequence: {{ encrypt_sequence | map(attribute='host') | zip(encrypt_sequence | map(attribute='method')) | map('join', '=') | join(' → ') }}"
+          - "Rollback after the first wipe = resync from the two surviving members. Nothing else."
+      run_once: true
+
+# ── Leg 1: mongo3 — LOGICAL (first encrypted node; no encrypted source exists yet) ──
+- name: "04 | Leg 1 — mongo3 (LOGICAL initial sync)"
+  hosts: mongo3
+  gather_facts: false
+  # destructive: the legacy mongo binary is gone once the community packages go
+    # (see group_vars/all.yml and tasks/preflight-common.yml)
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "04 | leg 1"
+      ansible.builtin.include_tasks: ../tasks/encrypt-leg.yml
+      vars:
+        leg_method: logical
+        leg_expected_state: 2
+
+# ── Leg 2: mongo1 — FCBIS from the now-encrypted mongo3 ────────────────────────────
+- name: "04 | Leg 2 — mongo1 (FCBIS from mongo3)"
+  hosts: mongo1
+  gather_facts: false
+  # destructive: the legacy mongo binary is gone once the community packages go
+    # (see group_vars/all.yml and tasks/preflight-common.yml)
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "04 | never start a leg while the previous leg is still syncing"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "04 | leg 2"
+      ansible.builtin.include_tasks: ../tasks/encrypt-leg.yml
+      vars:
+        leg_method: fcbis
+        leg_source: mongo3
+        leg_expected_state: 2
+
+# ── Leg 3: mongo2 — the primary, last; one graceful failover ───────────────────────
+- name: "04 | Leg 3 — mongo2 (primary, FCBIS from mongo3)"
+  hosts: mongo2
+  gather_facts: false
+  # destructive: the legacy mongo binary is gone once the community packages go
+    # (see group_vars/all.yml and tasks/preflight-common.yml)
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "04 | graceful stepDown before the primary is wiped (guardrail G2)"
+      ansible.builtin.include_tasks: ../tasks/stepdown.yml
+      vars:
+        stepdown_seconds: 120
+
+    - name: "04 | leg 3"
+      ansible.builtin.include_tasks: ../tasks/encrypt-leg.yml
+      vars:
+        leg_method: fcbis
+        leg_source: mongo3
+
+# ── Close-out: priority-2 member back as primary ───────────────────────────────────
+- name: "04 | close-out — topology and encryption on every member"
+  hosts: prod_live
+  gather_facts: false
+  # Every step below runs after the community packages are removed, and the legacy `mongo`
+  # binary belongs to them. Refuse to start unless mongosh is present (preflight-common.yml).
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "04 | re-read state"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "04 | encryption status"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify(db.serverStatus().encryptionAtRest)'] }}"
+      register: enc_final
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: "04 | exactly one primary, and every member encrypted"
+      ansible.builtin.assert:
+        that:
+          - (enc_final.stdout | from_json).encryptionEnabled | default(false)
+          - (enc_final.stdout | from_json).encryptionCipherMode == encryption_cipher
+          - mongo_rs_status.members | selectattr('state', 'equalto', 1) | list | length == 1
+        fail_msg: >-
+          {{ inventory_hostname }}: encryption={{ enc_final.stdout | default('no output') }},
+          members={{ mongo_rs_status.members | map(attribute='state') | list }}.
+          Phase 2 is not complete until every member is AES256-GCM and the set has one primary.
+        quiet: true
+
+    - name: "04 | cluster summary"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ ansible_host }}): {{ mongo_build.version }}, FCV {{ mongo_fcv }},
+          {{ (mongo_hello.isWritablePrimary | default(false)) | ternary('PRIMARY', 'SECONDARY') }},
+          encrypted={{ (enc_final.stdout | from_json).encryptionEnabled }}

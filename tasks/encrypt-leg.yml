@@ -1,0 +1,364 @@
+---
+# One encryption leg = one node wiped and resynced. Destructive: gated.
+# Vars: leg_method ('logical' | 'fcbis'), leg_source (hostname, required for fcbis)
+- name: "Leg | gates"
+  ansible.builtin.assert:
+    that:
+      - change_ticket is defined and change_ticket | length > 3
+      - confirm_window | default('') == 'YES'
+      - confirm_wipe | default('') == 'WIPE'
+      - leg_method | default('') in ['logical', 'fcbis']
+      - db_path == '/DATA/mongo'
+      - leg_method == 'logical' or leg_source is defined
+    fail_msg: >-
+      Refusing to run. Requires -e change_ticket=CHG-xxxx -e confirm_window=YES
+      -e confirm_wipe=WIPE, a valid leg_method, and (for FCBIS) a leg_source.
+      db_path must be exactly /DATA/mongo.
+    quiet: true
+
+- name: "Leg | identity, membership and health"
+  ansible.builtin.include_tasks: preflight-common.yml
+
+# The set's member names are mongo1 / mongo2 / db-node-3, not the inventory names. Matching
+# rs.status() entries against an inventory name (e.g. "mongo3") matches nothing, and the
+# `| first` below would then fail on an empty sequence mid-window. Resolve it properly.
+- name: "Leg | resolve the donor's replica-set member name"
+  ansible.builtin.set_fact:
+    leg_source_rs_name: "{{ rs_member_by_ip[hostvars[leg_source].ansible_host] | default('') }}"
+  when: leg_source is defined
+
+- name: "Leg | the target must be a SECONDARY and the whole set must be steady"
+  ansible.builtin.assert:
+    that:
+      # default(TRUE): if the role cannot be determined, assume it is the PRIMARY and refuse
+      # to wipe. `default(false)` would let an unknown role read as "safe to wipe".
+      - not (mongo_hello.isWritablePrimary | default(true))
+      - mongo_rs_status.members | selectattr('health', 'equalto', 1) | list | length == 3
+      # With no backup, a member in STARTUP2/RECOVERING/ARBITER-only state means we would be
+      # wiping while a second member is already not fully serving.
+      - mongo_rs_status.members | map(attribute='state') | reject('in', [1, 2]) | list | length == 0
+    fail_msg: >-
+      {{ inventory_hostname }} is the primary, or the set is not fully healthy and steady
+      (states: {{ mongo_rs_status.members | map(attribute='state') | list }}). Wiping a member of a
+      degraded set removes the only copy of that data — there is no backup.
+    quiet: true
+
+# ── CONFIG GATE (the 25 Aug incident: a missing block produced a plaintext/encrypted hybrid) ──
+- name: "Leg | write the security block for THIS node only"
+  ansible.builtin.include_tasks: merge-mongod-conf.yml
+  vars:
+    conf_label: "enc-{{ leg_method }}"
+    conf_merge: >-
+      {{ {'security': {'enableEncryption': true,
+                       'encryptionKeyFile': encryption_key_file,
+                       'encryptionCipherMode': encryption_cipher}}
+         | combine(
+             ({'setParameter': {'initialSyncMethod': 'fileCopyBased',
+                                'initialSyncSourceReadPreference': fcbis_source_read_pref,
+                                'fileBasedInitialSyncMaxLagSec': fcbis_max_lag_sec,
+                                'fileBasedInitialSyncMaxCyclesWithoutProgress': fcbis_max_cycles_without_progress}
+               }) if leg_method == 'fcbis' else {}, recursive=True) }}
+
+- name: "Leg | config gate — every required key must be present exactly once"
+  ansible.builtin.shell: |
+    set -e
+    test "$(grep -c 'enableEncryption' {{ conf_file }})" = "1"
+    grep -q 'encryptionKeyFile: {{ encryption_key_file }}' {{ conf_file }}
+    grep -q 'encryptionCipherMode: {{ encryption_cipher }}' {{ conf_file }}
+    {% if leg_method == 'fcbis' %}
+    grep -q 'initialSyncMethod: fileCopyBased' {{ conf_file }}
+    grep -q 'initialSyncSourceReadPreference: {{ fcbis_source_read_pref }}' {{ conf_file }}
+    grep -q 'fileBasedInitialSyncMaxLagSec: {{ fcbis_max_lag_sec }}' {{ conf_file }}
+    grep -q 'fileBasedInitialSyncMaxCyclesWithoutProgress: {{ fcbis_max_cycles_without_progress }}' {{ conf_file }}
+    {% endif %}
+    echo CONFIG-GATE-PASS
+  register: config_gate
+  changed_when: false
+  check_mode: false
+
+- name: "Leg | config gate result"
+  ansible.builtin.assert:
+    that:
+      - "'CONFIG-GATE-PASS' in config_gate.stdout"
+    fail_msg: >-
+      CONFIG GATE FAILED on {{ inventory_hostname }}. The encryption/initial-sync block is not
+      what it must be. Do NOT stop mongod — fix the config first.
+    quiet: true
+
+# ── FCBIS constraints (guardrail G10) ─────────────────────────────────────────
+# The bracket in the pattern is deliberate: `pgrep -f` matches the *shell running this script*
+# as well, so an unbracketed 'mongodump' pattern always matches itself and the gate can never
+# pass.
+- name: "Leg | no backup may run on the source or the target during a sync"
+  ansible.builtin.shell: |
+    if pgrep -af '[m]ongodump|[m]ongorestore|[p]bm backup|[p]bm agent' ; then
+      echo BACKUP-RUNNING
+      exit 1
+    fi
+    echo NO-BACKUP
+  register: backup_probe
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when: leg_method == 'fcbis'
+
+- name: "Leg | backup probe result"
+  ansible.builtin.assert:
+    that:
+      - "'NO-BACKUP' in backup_probe.stdout"
+    fail_msg: "A backup process is running on {{ inventory_hostname }}. FCBIS + backup = aborted or corrupt sync."
+    quiet: true
+  when: leg_method == 'fcbis'
+
+- name: "Leg | the FCBIS source must exist, be encrypted and be healthy"
+  ansible.builtin.command:
+    argv: "{{ hostvars[leg_source].mongo_base_argv + ['127.0.0.1:' ~ (hostvars[leg_source].mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify(db.serverStatus().encryptionAtRest)'] }}"
+  delegate_to: "{{ leg_source }}"
+  register: source_enc
+  changed_when: false
+  check_mode: false
+  no_log: true
+  when: leg_method == 'fcbis'
+
+- name: "Leg | FCBIS source must already be encrypted (it donates its key and its files)"
+  ansible.builtin.assert:
+    that:
+      - (source_enc.stdout | from_json).encryptionEnabled | default(false)
+      - leg_source != inventory_hostname
+    fail_msg: >-
+      {{ leg_source }} is not encrypted, or equals the target. The first encrypted node must be
+      LOGICAL; every FCBIS source must already be encrypted with the shared key.
+    quiet: true
+  when: leg_method == 'fcbis'
+
+# With no backup, the source is the only copy of this node's data: it must be fully serving.
+# NOTE: `leg_source` is what we verify and delegate against, not a pin. With
+# initialSyncSourceReadPreference=secondary the server picks any eligible secondary, and both
+# candidates are encrypted with the same shared key (G11), so either is a valid donor.
+- name: "Leg | the FCBIS source must be healthy and not itself syncing"
+  ansible.builtin.assert:
+    that:
+      - leg_source_rs_name | length > 0
+      - mongo_rs_status.members | selectattr('name', 'match', '^' ~ leg_source_rs_name ~ ':') | list | length == 1
+      - mongo_rs_status.members | selectattr('name', 'match', '^' ~ leg_source_rs_name ~ ':') | map(attribute='health') | first | int == 1
+      - mongo_rs_status.members | selectattr('name', 'match', '^' ~ leg_source_rs_name ~ ':') | map(attribute='state') | first | int in [1, 2]
+    fail_msg: >-
+      The sync source {{ leg_source }} (replica-set name "{{ leg_source_rs_name }}") is not
+      healthy/serving ({{ mongo_rs_status.members | map(attribute='name') | list }}).
+      Wiping this node now would leave the set with one usable member and no backup.
+    quiet: true
+  when: leg_method == 'fcbis'
+
+# ── Destructive part ──────────────────────────────────────────────────────────
+# The FCBIS proof has to be captured DURING the leg. /var/log/mongodb keeps 7 days (confirmed on
+# 10.0.0.21: 9 files, oldest 2026-11-13), so by the time anyone audits the window the lines
+# are gone — that is exactly why the reference-cluster migration cannot be proven to have used FCBIS.
+- name: "Leg | mark the log position this leg starts from"
+  ansible.builtin.shell: |
+    if [ -f {{ system_log }} ]; then wc -l < {{ system_log }}; else echo 0; fi
+  register: log_offset
+  changed_when: false
+  check_mode: false
+
+- name: "Leg | record the sync start time (FCBIS vs logical is hours apart)"
+  ansible.builtin.set_fact:
+    isync_t0: "{{ now().timestamp() | int }}"
+
+- name: "Leg | stop mongod on {{ inventory_hostname }}"
+  ansible.builtin.systemd:
+    name: mongod
+    state: stopped
+
+- name: "Leg | wipe {{ db_path }} (asynchronous — ~0.8 TB of files)"
+  ansible.builtin.shell: |
+    set -e
+    test "{{ db_path }}" = "/DATA/mongo"
+    find {{ db_path }} -mindepth 1 -delete
+    test -z "$(find {{ db_path }} -mindepth 1 -print -quit)"
+  async: 7200
+  poll: 30
+  register: wipe
+  changed_when: true
+
+- name: "Leg | the directory must be empty, still owned by mongod"
+  ansible.builtin.file:
+    path: "{{ db_path }}"
+    state: directory
+    owner: mongod
+    group: mongod
+    mode: "0750"
+
+- name: "Leg | start mongod (initial sync begins automatically)"
+  ansible.builtin.systemd:
+    name: mongod
+    state: started
+
+- name: "Leg | wait for the member to resync"
+  ansible.builtin.include_tasks: wait-member-synced.yml
+  vars:
+    # A ~0.8 TB wipe + initial sync is 1–3 h; the 15-minute restart budget is far too short.
+    wait_retries: "{{ resync_wait_retries | default(960) }}"
+    wait_delay: "{{ resync_wait_delay | default(15) }}"
+    max_lag_sec: 30
+    # Legs 1 and 2 must end as SECONDARY. Leg 3 is the priority-2 member: it re-elects itself
+    # within seconds of finishing, so it is checked as "in service" and the close-out asserts
+    # exactly one primary.
+    expected_state: "{{ leg_expected_state | default('') }}"
+
+- name: "Leg | encryption must actually be on"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify(db.serverStatus().encryptionAtRest)'] }}"
+  register: enc_now
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: "Leg | verify AES256-GCM is active on {{ inventory_hostname }}"
+  ansible.builtin.assert:
+    that:
+      - (enc_now.stdout | from_json).encryptionEnabled | default(false)
+      - (enc_now.stdout | from_json).encryptionCipherMode == encryption_cipher
+    fail_msg: >-
+      {{ inventory_hostname }} reports {{ enc_now.stdout | default('no output') }}. The node is
+      NOT encrypted as intended — stop the run and inspect before touching the next node.
+    quiet: true
+
+# ── FCBIS PROOF ───────────────────────────────────────────────────────────────
+# Three independent things are checked here, because "the config file says fileCopyBased" proves
+# only that a file was written:
+#   1. the RUNNING server reports the parameters (getCmdLineOpts) — a config file alone can be
+#      ignored, and the previous process could still be the old one;
+#   2. the log window for THIS leg contains no fallback/unsupported marker — PSMDB silently
+#      degrades to logical sync ("Falling back to logical initial sync"), which would still
+#      produce a correct dataset but take hours and blow the window;
+#   3. at least one positive marker, so the copy is positively evidenced rather than merely
+#      not-contradicted. Overridable with -e fcbis_evidence_override=YES, only after a human has
+#      read the window file — the marker's log level is not documented by Percona.
+- name: "Leg | what the RUNNING server actually parsed (not just the file)"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'print(JSON.stringify((db.adminCommand({getCmdLineOpts:1}).parsed.setParameter)||{}))'] }}"
+  register: cmdline_opts
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: "Leg | parse the running server's startup parameters"
+  ansible.builtin.set_fact:
+    # `| last`: the legacy mongo shell and mongosh can emit a banner line, so never assume the
+    # JSON is the whole of stdout.
+    running_sp: "{{ (cmdline_opts.stdout_lines | last) | from_json }}"
+
+- name: "Leg | on an FCBIS leg the RUNNING server must carry the file-copy parameters"
+  ansible.builtin.assert:
+    that:
+      - running_sp.initialSyncMethod == 'fileCopyBased'
+      - running_sp.initialSyncSourceReadPreference == fcbis_source_read_pref
+      - running_sp.fileBasedInitialSyncMaxLagSec | int == fcbis_max_lag_sec | int
+      - running_sp.fileBasedInitialSyncMaxCyclesWithoutProgress | int == fcbis_max_cycles_without_progress | int
+    fail_msg: >-
+      {{ inventory_hostname }} is running with {{ running_sp }} — the file-copy parameters are NOT
+      active. The node works, but it did a LOGICAL sync (hours) or will revert to one. Do not start
+      the next leg until this is explained.
+    quiet: true
+  when: leg_method == 'fcbis'
+
+- name: "Leg | capture the initial-sync log window for THIS leg only"
+  ansible.builtin.shell: |
+    LOG="{{ system_log }}"
+    OFF={{ log_offset.stdout | default('0', true) | int }}
+    CUR=$( [ -f "$LOG" ] && wc -l < "$LOG" || echo 0 )
+    # The log rotates on a 1 GiB trigger, which a multi-hour sync can cross. If the file is now
+    # shorter than it was before the restart, the whole file is this leg's window.
+    if [ "$CUR" -lt "$OFF" ]; then OFF=0; fi
+    WIN=/tmp/initial-sync-{{ inventory_hostname }}.log
+    tail -n +$((OFF + 1)) "$LOG" > "$WIN"
+    M=$(grep -c -- "{{ fcbis_log_marker }}" "$WIN" || true)
+    T=$(grep -c -- "{{ fcbis_log_token }}" "$WIN" || true)
+    F=$(grep -c -- "{{ fcbis_log_fallback }}" "$WIN" || true)
+    N=$(grep -c -- "{{ fcbis_log_no_support }}" "$WIN" || true)
+    B=$(grep -c -- "{{ fcbis_log_bad_source }}" "$WIN" || true)
+    W=$(wc -l < "$WIN")
+    printf '{"window_lines": %s, "marker": %s, "token": %s, "fallback": %s, "no_support": %s, "bad_source": %s}\n' \
+      "$W" "$M" "$T" "$F" "$N" "$B"
+  register: isync
+  changed_when: false
+  check_mode: false
+
+- name: "Leg | parse the initial-sync evidence"
+  ansible.builtin.set_fact:
+    isync_ev: "{{ isync.stdout_lines | last | from_json }}"
+    isync_elapsed_sec: "{{ (now().timestamp() | int) - (isync_t0 | int) }}"
+
+- name: "Leg | the build must support FCBIS and must NOT have fallen back to logical sync"
+  ansible.builtin.assert:
+    that:
+      - isync_ev.no_support | int == 0
+      - isync_ev.bad_source | int == 0
+      - isync_ev.fallback | int == 0
+    fail_msg: >-
+      {{ inventory_hostname }} logged a fallback to LOGICAL initial sync, or this build of PSMDB
+      does not provide FCBIS (evidence: {{ isync_ev }}). The node is still correct and encrypted —
+      but the window estimate is void. Do not start the next leg without re-planning the time.
+    quiet: true
+
+- name: "Leg | on an FCBIS leg the file copy must be positively evidenced"
+  ansible.builtin.assert:
+    that:
+      - ((isync_ev.marker | int) + (isync_ev.token | int)) > 0 or fcbis_evidence_override | default('') == 'YES'
+    fail_msg: >-
+      No file-copy marker in this leg's log window ({{ isync_ev }}). Either the copy genuinely did
+      not happen, or the marker is logged above the default verbosity. Read
+      /tmp/initial-sync-{{ inventory_hostname }}.log on {{ inventory_hostname }} and then either
+      stop, or re-run this leg's remaining steps with -e fcbis_evidence_override=YES.
+    quiet: true
+  when: leg_method == 'fcbis'
+
+- name: "Leg | persist the evidence excerpt on the control host (7-day log retention)"
+  ansible.builtin.shell: |
+    grep -iE "file copy|FCBIS|initial sync" /tmp/initial-sync-{{ inventory_hostname }}.log | tail -40 \
+      > /tmp/fcbis-evidence-{{ inventory_hostname }}.excerpt || true
+    wc -l < /tmp/fcbis-evidence-{{ inventory_hostname }}.excerpt
+  changed_when: false
+  check_mode: false
+
+- name: "Leg | fetch the evidence excerpt into artifacts/"
+  ansible.builtin.fetch:
+    src: "/tmp/fcbis-evidence-{{ inventory_hostname }}.excerpt"
+    dest: "{{ playbook_dir | dirname }}/artifacts/fcbis-evidence/{{ inventory_hostname }}-{{ leg_method }}-{{ now().strftime('%Y%m%d-%H%M%S') }}.log"
+    flat: true
+  changed_when: false
+  failed_when: false
+
+# With no logical backup for this cluster, this fingerprint is the only proof that the wipe
+# actually produced a complete dataset. A short resync must never be allowed to pass silently.
+- name: "Leg | fingerprint the resynced node"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', fingerprint_js] }}"
+  register: leg_fp
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: "Leg | the resynced node must hold at least the Phase-0 baseline document count"
+  ansible.builtin.assert:
+    that:
+      # NO `| default(0)` here. A missing baseline is the one case where this gate would pass
+      # vacuously (`total >= 0` is always true) — and with no backup this comparison is the ONLY
+      # proof that a wipe+resync produced a complete dataset. Fail closed instead.
+      - baseline_fp_total is defined
+      - (baseline_fp_total | int) > 0
+      - (leg_fp.stdout | from_json).total | int >= (baseline_fp_total | int)
+    fail_msg: >-
+      COMPLETENESS CHECK FAILED on {{ inventory_hostname }}: resynced
+      {{ (leg_fp.stdout | from_json).total }} documents vs baseline
+      {{ baseline_fp_total | default('unknown') }}. Do NOT start the next leg — re-wipe this node and
+      retry (fall back to logical sync). The other two members are still intact, which is exactly why
+      legs run one at a time.
+    quiet: true
+
+- name: "Leg | report"
+  ansible.builtin.debug:
+    msg:
+      - "{{ inventory_hostname }}: {{ leg_method }} sync complete, encrypted ({{ encryption_cipher }}), SECONDARY and in sync."
+      - "Documents on resynced node: {{ (leg_fp.stdout | from_json).total }} (baseline {{ baseline_fp_total | default('n/a') }})"
+      - "Initial sync took {{ isync_elapsed_sec }} s; log window {{ isync_ev.window_lines }} lines; markers: file-copy={{ isync_ev.marker }}, FCBIS={{ isync_ev.token }}, failed-logical-fallback={{ isync_ev.fallback }}"

@@ -1,0 +1,301 @@
+---
+# 06 — Verify and report. Read-only except for the smoke-test database it creates and drops.
+# Produces artifacts/verify-<stamp>.json + .md — the change record and the audit evidence.
+- name: "06 | per-node verification"
+  hosts: prod_live
+  gather_facts: false
+  # Every step below runs after the community packages are removed, and the legacy `mongo`
+  # binary belongs to them. Refuse to start unless mongosh is present (preflight-common.yml).
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "06 | identity, membership and health"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "06 | encryption status"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify(db.serverStatus().encryptionAtRest)'] }}"
+      register: enc
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: "06 | transport security"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify(db.serverStatus().transportSecurity)'] }}"
+      register: transport
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: "06 | TLS path must work"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--tls', '--tlsCAFile', tls_ca, '--eval', 'print(\"TLS-OK\")'] }}"
+      register: tls_probe
+      changed_when: false
+      check_mode: false
+      no_log: true
+      failed_when: false
+
+    - name: "06 | non-TLS path must work too (end state = TLS and plaintext both accepted)"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'print(\"PLAINTEXT-OK\")'] }}"
+      register: plaintext_probe
+      changed_when: false
+      check_mode: false
+      no_log: true
+      failed_when: false
+
+    - name: "06 | both transports must be available on every member"
+      ansible.builtin.assert:
+        that:
+          - "'TLS-OK' in tls_probe.stdout"
+          - (tls_mode | default('preferTLS')) != 'preferTLS' or 'PLAINTEXT-OK' in plaintext_probe.stdout
+        fail_msg: >-
+          {{ inventory_hostname }}: tls={{ 'PASS' if 'TLS-OK' in tls_probe.stdout else 'FAIL' }},
+          plaintext={{ 'PASS' if 'PLAINTEXT-OK' in plaintext_probe.stdout else 'FAIL' }}. This change
+          requires TLS *and* non-TLS to be accepted; a plaintext-only or TLS-only server breaks either
+          the apps that have migrated or the ones that have not.
+        quiet: true
+
+    - name: "06 | fingerprint (secondaries only — never load the primary)"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', fingerprint_js] }}"
+      register: fingerprint
+      changed_when: false
+      check_mode: false
+      no_log: true
+      when: not (mongo_hello.isWritablePrimary | default(true))
+
+    - name: "06 | target build and FCV"
+      ansible.builtin.assert:
+        that:
+          - mongo_build.version is search('^' ~ (target_major | regex_escape))
+          - mongo_fcv | string is search('^' ~ (target_major | regex_escape))
+          - mongo_rs_status.members | selectattr('health', 'equalto', 1) | list | length == 3
+        fail_msg: >-
+          {{ inventory_hostname }}: version={{ mongo_build.version }} fcv={{ mongo_fcv }} health
+          {{ mongo_rs_status.members | map(attribute='health') | list }}.
+        quiet: true
+
+    - name: "06 | encryption must be on for every member"
+      ansible.builtin.assert:
+        that:
+          - (enc.stdout | from_json).encryptionEnabled | default(false)
+          - (enc.stdout | from_json).encryptionCipherMode == encryption_cipher
+        fail_msg: "{{ inventory_hostname }} is not encrypted: {{ enc.stdout | default('no output') }}"
+        quiet: true
+
+- name: "06 | smoke test through the real replica-set path (primary write → secondary read → cleanup)"
+  hosts: mongo3
+  gather_facts: false
+  vars:
+    require_mongosh: true
+    smoke_db: "_ops_migration_smoke"
+    smoke_token: "migration-smoke-{{ now(fmt='%Y%m%d%H%M%S') }}"
+  tasks:
+    - name: "06 | write a marker document to the primary"
+      ansible.builtin.command:
+        argv: "{{ mongo_rs_argv + ['--eval', 'db.getSiblingDB(\"{{ smoke_db }}\").t.insertOne({_id:\"{{ smoke_token }}\", at:new Date()}); print(\"WROTE\")'] }}"
+      register: smoke_write
+      changed_when: true
+      no_log: true
+
+    - name: "06 | read it back from THIS secondary (proves replication, not just a local write)"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'db.getMongo().setReadPref(\"secondary\"); print(JSON.stringify(db.getSiblingDB(\"{{ smoke_db }}\").t.findOne({_id:\"{{ smoke_token }}\"})))'] }}"
+      register: smoke_read
+      changed_when: false
+      check_mode: false
+      no_log: true
+      until: smoke_token in smoke_read.stdout
+      retries: 20
+      delay: 3
+      failed_when: false
+
+    - name: "06 | the marker must have replicated"
+      ansible.builtin.assert:
+        that:
+          - smoke_token in smoke_read.stdout
+        fail_msg: >-
+          The marker written to the primary was not visible on {{ inventory_hostname }}.
+          Replication is broken — do not close the window.
+        quiet: true
+
+    - name: "06 | plaintext-leak scan (sampled: 10 newest data files must not contain the token)"
+      # INDICATIVE ONLY. WiredTiger block compression can hide a plaintext token, so a PASS here
+      # does not prove encryption — the authoritative check is serverStatus().encryptionAtRest
+      # plus the pre/post-migration differential scan described in the reference runbook.
+      ansible.builtin.shell: |
+        hits=$(ls -t {{ db_path }}/collection-*.wt 2>/dev/null | head -10 | xargs grep -a -c "{{ smoke_token }}" 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
+        echo "PLAINTEXT_HITS=$hits"
+      register: leak_scan
+      changed_when: false
+      check_mode: false
+
+    - name: "06 | no plaintext leak on {{ inventory_hostname }}"
+      ansible.builtin.assert:
+        that:
+          - "'PLAINTEXT_HITS=0' in leak_scan.stdout"
+        fail_msg: >-
+          The smoke token is readable in plaintext in {{ db_path }} on {{ inventory_hostname }}.
+          At-rest encryption is not effective — treat as an incident.
+        quiet: true
+
+    - name: "06 | cleanup the smoke database"
+      ansible.builtin.command:
+        argv: "{{ mongo_rs_argv + ['--eval', 'db.getSiblingDB(\"{{ smoke_db }}\").dropDatabase(); print(\"DROPPED\")'] }}"
+      register: smoke_drop
+      changed_when: true
+      no_log: true
+
+- name: "06 | report"
+  hosts: localhost
+  gather_facts: false
+  # Same reason as 00-preflight: implicit localhost sees only group 'all', while cluster identity
+  # and the fingerprint tolerance live in group_vars/prod_live/. Loaded explicitly so the report
+  # and the tolerance gate resolve instead of failing as undefined.
+  vars_files:
+    - "{{ playbook_dir }}/../inventory/group_vars/prod_live/main.yml"
+  vars:
+    artifact_glob: "{{ artifact_dir }}/baseline-*.json"
+  tasks:
+    - name: "06 | locate the Phase-0 baseline"
+      ansible.builtin.set_fact:
+        baseline_files: "{{ query('fileglob', artifact_glob) | sort }}"
+
+    - name: "06 | load the baseline"
+      ansible.builtin.set_fact:
+        baseline: "{{ (lookup('file', baseline_files | last) | from_json) if baseline_files | length > 0 else {} }}"
+
+    - name: "06 | collect current state"
+      # NOTE: the Jinja below is inside a `>-` folded scalar, so YAML comments cannot appear
+      # inside it — characters there are literal template text. Hence `none`, not `null`
+      # (`null` is not a Jinja literal and yields Undefined), and the guard tests `.stdout`
+      # (a SKIPPED task still registers its variable, so `is defined` is true for the primary).
+      ansible.builtin.set_fact:
+        verify_hosts: >-
+          {{ (verify_hosts | default([])) + [{
+            'host': item,
+            'ip': hostvars[item].ansible_host,
+            'role': (hostvars[item].mongo_hello.isWritablePrimary | default(false)) | ternary('PRIMARY', 'SECONDARY'),
+            'version': hostvars[item].mongo_build.version,
+            'psmdb': hostvars[item].mongo_build.psmdbVersion | default('n/a'),
+            'fcv': hostvars[item].mongo_fcv,
+            'encryption': (hostvars[item].enc.stdout | from_json),
+            'transport': (hostvars[item].transport.stdout | from_json),
+            'tls_mode': tls_mode | default('preferTLS'),
+            'tls_probe': 'PASS' if 'TLS-OK' in hostvars[item].tls_probe.stdout else 'FAIL',
+            'plaintext_probe': 'PASS' if 'PLAINTEXT-OK' in hostvars[item].plaintext_probe.stdout else 'FAIL',
+            'fingerprint': ((hostvars[item].fingerprint.stdout | from_json).total
+                             if (hostvars[item].fingerprint.stdout is defined) else none),
+            'fingerprint_per_db': ((hostvars[item].fingerprint.stdout | from_json).perDb
+                             if (hostvars[item].fingerprint.stdout is defined) else none)
+          }] }}
+      loop: "{{ groups['prod_live'] }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "06 | collect member fingerprint values"
+      # Exact equality across members is NOT a valid gate on a live cluster: writes land between
+      # two members' samples. Measured 2026-11-19 — both secondaries healthy and in sync, totals
+      # 1,169,656,301 vs 1,169,646,605 (9,696 apart, 8 ppm). The spread is therefore compared
+      # against the same tolerance 00-preflight uses, while the baseline guard stays strict in
+      # the loss direction: current must never be BELOW the Phase-0 baseline.
+      ansible.builtin.set_fact:
+        fp_values: >-
+          {{ verify_hosts | selectattr('fingerprint', 'ne', none)
+             | map(attribute='fingerprint') | map('int') | list }}
+
+    - name: "06 | reference fingerprint, spread and tolerance"
+      ansible.builtin.set_fact:
+        baseline_total: "{{ baseline.fingerprint_total | default('unknown') }}"
+        current_total: "{{ (fp_values | max) if fp_values | length > 0 else 'unknown' }}"
+        fp_spread: "{{ ((fp_values | max) - (fp_values | min)) if fp_values | length > 0 else 'unknown' }}"
+        fp_tolerance: >-
+          {{ ([fingerprint_max_abs_delta | int,
+              (((fp_values | min | int) * (fingerprint_max_rel_pct | float)) / 100) | int] | max)
+             if fp_values | length > 0 else 0 }}
+
+    - name: "06 | fingerprints must agree within tolerance, and must not have lost documents"
+      ansible.builtin.assert:
+        that:
+          - fp_values | length >= 1
+          - (fp_spread | int) <= (fp_tolerance | int)
+          - baseline_total == 'unknown' or (current_total | int) >= (baseline_total | int)
+        fail_msg: >-
+          Fingerprint check failed: baseline={{ baseline_total }}, current={{ current_total }},
+          spread={{ fp_spread }}, tolerance={{ fp_tolerance }}
+          (members: {{ verify_hosts | map(attribute='host') | zip(verify_hosts | map(attribute='fingerprint')) | map('join', '=') | join(', ') }}).
+          A spread beyond tolerance is a replication divergence; a NEGATIVE delta against the
+          baseline is data loss — escalate.
+        quiet: true
+
+    # Per-database, because a 585k-document total tolerance would hide the loss of a whole
+    # collection. Same rule as 00-preflight: 0.01% relative with a 100k floor — sized from measured noise.
+    - name: "06 | collect the sampled per-database maps and their name set"
+      ansible.builtin.set_fact:
+        fp_perdb: "{{ verify_hosts | selectattr('fingerprint_per_db', 'ne', none)
+                      | map(attribute='fingerprint_per_db') | list }}"
+        fp_dbnames: >-
+          {{ verify_hosts | selectattr('fingerprint_per_db', 'ne', none)
+             | map(attribute='fingerprint_per_db') | map('dictsort') | map('map', attribute=0)
+             | flatten | unique | sort | list }}
+
+    - name: "06 | every sampled member must expose the same database set"
+      ansible.builtin.assert:
+        that:
+          - fp_perdb | map('dictsort') | map('map', attribute=0) | map('list') | map('sort')
+            | map('to_json') | unique | list | length == 1
+        fail_msg: >-
+          Members expose different database sets after the change
+          ({{ fp_perdb | map('dictsort') | map('map', attribute=0) | map('list') | map('sort') | list }}).
+          A database lost in migration or resync — escalate.
+        quiet: true
+
+    - name: "06 | per-database fingerprints must be within tolerance"
+      ansible.builtin.assert:
+        that:
+          - _db_delta | int <= _db_tolerance | int
+        fail_msg: >-
+          Database '{{ item }}' differs by {{ _db_delta }} documents across members
+          ({{ _counts }}), tolerance {{ _db_tolerance }} — real divergence or data loss. Escalate.
+        quiet: true
+      vars:
+        _counts: "{{ fp_perdb | map(attribute=item) | map('int') | list }}"
+        _db_delta: "{{ (_counts | max) - (_counts | min) }}"
+        _db_tolerance: >-
+          {{ [fingerprint_db_max_abs_delta | int,
+              (((_counts | min | int) * (fingerprint_db_max_rel_pct | float)) / 100) | int] | max }}
+      loop: "{{ fp_dbnames }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "06 | write the verify report"
+      ansible.builtin.copy:
+        dest: "{{ artifact_dir }}/verify-{{ now(fmt='%Y%m%d-%H%M%S') }}.json"
+        mode: "0600"
+        content: |
+          {{ {
+            'cluster': cluster_id,
+            'label': cluster_label,
+            'change': change_ticket | default('n/a'),
+            'replica_set': replset_name,
+            'verified_at': now(fmt='%Y-%m-%dT%H:%M:%S'),
+            'baseline_file': baseline_files | last | default('none'),
+            'fingerprint': {'baseline': baseline_total, 'current': current_total,
+                            'spread': fp_spread, 'tolerance': fp_tolerance,
+                            'delta': ((current_total | int) - (baseline_total | int)) if baseline_total != 'unknown' else 'n/a'},
+            'hosts': verify_hosts,
+            'result': 'PASS'
+          } | to_nice_json }}
+
+    - name: "06 | human-readable summary"
+      ansible.builtin.debug:
+        msg:
+          - "PROD LIVE — {{ replset_name }} — verification PASS"
+          - "{{ verify_hosts | map(attribute='host') | zip(verify_hosts | map(attribute='version'), verify_hosts | map(attribute='role')) | map('join', ' / ') | join(' | ') }}"
+          - "Encryption: {{ verify_hosts | map(attribute='encryption') | map(attribute='encryptionCipherMode') | unique | join(',') }}"
+          - "Transport: {{ verify_hosts | map(attribute='tls_mode') | unique | join(',') }} (TLS accepted; plaintext accepted by decision)"
+          - "Documents: baseline {{ baseline_total }} → current {{ current_total }} (delta {{ ((current_total | int) - (baseline_total | int)) if baseline_total != 'unknown' else 'n/a' }}, live writes expected; member spread {{ fp_spread }} vs tolerance {{ fp_tolerance }})"
+          - "Report: {{ artifact_dir }}/verify-*.json"

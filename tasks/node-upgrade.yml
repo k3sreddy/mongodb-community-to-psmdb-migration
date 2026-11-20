@@ -1,0 +1,321 @@
+---
+# One node, one major hop. Call only from a play with serial: 1.
+# Requires: hop ("6.0" | "7.0" | "8.0"), mongo_build, mongo_fcv (from preflight-common.yml)
+
+- name: "Upgrade | resolve hop definition"
+  ansible.builtin.set_fact:
+    hop_info: "{{ upgrade_hops | selectattr('major', 'equalto', hop) | first }}"
+    expected_prev_major: "{{ (upgrade_hops | selectattr('major', 'equalto', hop) | first).previous_major }}"
+
+- name: "Upgrade | {{ hop }} | never skip a hop (FCV/binary ratchet, guardrail G12)"
+  ansible.builtin.assert:
+    that:
+      - mongo_build.version is search('^' ~ (expected_prev_major | regex_escape))
+      - mongo_fcv | string is search('^' ~ (expected_prev_major | regex_escape))
+    fail_msg: >-
+      {{ inventory_hostname }} runs version={{ mongo_build.version }} fcv={{ mongo_fcv }} but hop
+      {{ hop }} must start from {{ expected_prev_major }}. Run the hops in order.
+    quiet: true
+
+# ── Before anything is stopped: what is installed, and what would collide? ────────
+- name: "Upgrade | {{ hop }} | read the installed package set"
+  ansible.builtin.command: rpm -qa
+  register: installed_pkgs
+  changed_when: false
+  check_mode: false
+
+- name: "Upgrade | {{ hop }} | classify installed packages"
+  ansible.builtin.set_fact:
+    community_pkgs: "{{ installed_pkgs.stdout_lines | select('search', '^mongodb-org') | list }}"
+    psmdb_pkgs: "{{ installed_pkgs.stdout_lines | select('search', '^percona-server-mongodb') | list }}"
+
+- name: "Upgrade | {{ hop }} | package transition plan"
+  ansible.builtin.debug:
+    msg:
+      - "community (mongodb-org) present: {{ community_pkgs | length }} → {{ community_pkgs | join(', ') if community_pkgs | length else 'none' }}"
+      - "percona-server-mongodb present   : {{ psmdb_pkgs | length }}"
+      - "{{ 'Will REMOVE the community packages before installing PSMDB (they own the same files: /usr/bin/mongod, /etc/mongod.conf).' if community_pkgs | length else 'Pure Percona node — straight package upgrade.' }}"
+
+# ── Rollback material. With no data backup, this is the ONLY way back for Phase 1. ──
+- name: "Upgrade | {{ hop }} | stage the CURRENTLY INSTALLED RPM set for rollback"
+  ansible.builtin.shell: |
+    set -u
+    D="{{ rpm_stage_dir }}-{{ expected_prev_major }}"
+    mkdir -p "$D"
+    rm -f "$D/download-warnings.txt"
+    rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' | grep -i mongo | sort > "$D/installed.txt" || true
+    while read -r pkg; do
+      [ -n "$pkg" ] || continue
+      dnf -y download --resolve --alldeps --destdir="$D" "$pkg" >/dev/null 2>&1 \
+        || echo "MISSING-FROM-REPO $pkg" >> "$D/download-warnings.txt"
+    done < "$D/installed.txt"
+    ls -1 "$D"/*.rpm 2>/dev/null | wc -l
+  args:
+    creates: "{{ rpm_stage_dir }}-{{ expected_prev_major }}/installed.txt"
+  register: rpm_stage
+
+- name: "Upgrade | {{ hop }} | how many rollback RPMs are actually on disk?"
+  ansible.builtin.shell: |
+    ls -1 "{{ rpm_stage_dir }}-{{ expected_prev_major }}"/*.rpm 2>/dev/null | wc -l
+  register: staged_rpm_count
+  changed_when: false
+  check_mode: false
+
+- name: "Upgrade | {{ hop }} | which rollback packages could not be downloaded?"
+  ansible.builtin.shell: |
+    cat "{{ rpm_stage_dir }}-{{ expected_prev_major }}/download-warnings.txt" 2>/dev/null || true
+  register: staged_warnings
+  changed_when: false
+  check_mode: false
+
+- name: "Upgrade | {{ hop }} | the rollback set must be real, not just a directory (guardrail G15)"
+  ansible.builtin.assert:
+    that:
+      - staged_rpm_count.stdout | int >= (rpm_stage_min_count | default(4) | int)
+      - staged_warnings.stdout | trim | length == 0
+    fail_msg: >-
+      Rollback staging on {{ inventory_hostname }} is INCOMPLETE:
+      {{ staged_rpm_count.stdout | int }} RPM(s) on disk
+      (expected >= {{ rpm_stage_min_count | default(4) }})
+      {%- if staged_warnings.stdout | trim | length > 0 %},
+      undownloadable: {{ staged_warnings.stdout | trim }}{% endif %}.
+      After this hop the binary cannot be downgraded except by reinstalling these packages —
+      and the community packages are about to be REMOVED to make room for PSMDB. Fix the repo
+      state so the installed set can be downloaded, or record an explicit override with
+      -e allow_missing_rollback=YES and a written acceptance.
+    quiet: true
+  when: allow_missing_rollback | default('') != 'YES'
+
+- name: "Upgrade | {{ hop }} | rollback staging was overridden"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: allow_missing_rollback=YES — proceeding with {{ staged_rpm_count.stdout | int }}
+      staged RPM(s) and warnings: {{ staged_warnings.stdout | trim | default('none') }}.
+      Phase-1 rollback is now best-effort.
+  when: allow_missing_rollback | default('') == 'YES'
+
+- name: "Upgrade | {{ hop }} | keep a copy of the running binary (last-resort rollback)"
+  ansible.builtin.copy:
+    src: "{{ mongo_bin }}"
+    dest: "{{ rpm_stage_dir }}-{{ expected_prev_major }}/mongod-{{ mongo_build.version }}.bin"
+    remote_src: true
+    mode: "0755"
+    force: false
+
+- name: "Upgrade | {{ hop }} | enable Percona repo for this hop only"
+  ansible.builtin.shell: |
+    percona-release enable {{ hop_info.repo }} release >/dev/null
+    {% for r in (psmdb_repos + obsolete_repos) | reject('equalto', hop_info.repo) | list %}
+    percona-release disable {{ r }} release >/dev/null || true
+    {% endfor %}
+  changed_when: true
+
+# ── The point of no return for this node's binaries ───────────────────────────────
+- name: "Upgrade | {{ hop }} | save config and keyfile (guardrail G4)"
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ staged_config_dir }}/{{ item | basename }}.{{ expected_prev_major }}to{{ hop }}.bak"
+    remote_src: true
+    mode: "0600"
+    force: false
+  loop:
+    - "{{ conf_file }}"
+    - "{{ key_file }}"
+
+- name: "Upgrade | {{ hop }} | the config backup must exist before mongod is stopped"
+  ansible.builtin.stat:
+    path: "{{ staged_config_dir }}/{{ conf_file | basename }}.{{ expected_prev_major }}to{{ hop }}.bak"
+  register: conf_bak
+
+- name: "Upgrade | {{ hop }} | refuse to stop mongod without a restorable config (guardrail G4)"
+  ansible.builtin.assert:
+    that:
+      - conf_bak.stat.exists
+    fail_msg: >-
+      {{ staged_config_dir }}/{{ conf_file | basename }}.{{ expected_prev_major }}to{{ hop }}.bak
+      is missing on {{ inventory_hostname }}. The package will overwrite /etc/mongod.conf and
+      there would be nothing to restore — do not stop mongod.
+    quiet: true
+
+- name: "Upgrade | {{ hop }} | stop mongod"
+  ansible.builtin.systemd:
+    name: mongod
+    state: stopped
+
+# Community 5.0.8 ships mongodb-org-*; PSMDB owns the same paths. Installing one over the
+# other is a dnf file-conflict failure — with mongod already stopped that is an outage.
+# NOTE: `ansible.builtin.dnf` is unusable on these hosts. The dnf python bindings are built for
+# platform-python 3.6 only, while ansible-core 2.22 requires >= 3.7 on the target (see
+# group_vars/all.yml). So packages are driven through the `dnf` CLI via argv, and the result is
+# verified with `rpm -q` — the dnf module's own idempotency is replaced by an explicit check.
+- name: "Upgrade | {{ hop }} | remove the community packages that collide with PSMDB"
+  ansible.builtin.command:
+    argv: "{{ ['dnf', '-y', 'remove', '--setopt=clean_requirements_on_remove=False'] + community_pkgs }}"
+  register: pkg_remove
+  changed_when: "'Nothing to do' not in pkg_remove.stdout"
+  when: community_pkgs | length > 0
+
+- name: "Upgrade | {{ hop }} | confirm each community package is gone"
+  ansible.builtin.command:
+    argv: [rpm, -q, "{{ item }}"]
+  loop: "{{ community_pkgs }}"
+  register: community_gone
+  changed_when: false
+  failed_when: false
+  when: community_pkgs | length > 0
+
+# With mongod already stopped, a file conflict from a half-removed package is a full outage.
+- name: "Upgrade | {{ hop }} | the removal must have completed before anything is installed"
+  ansible.builtin.assert:
+    that:
+      - item.rc is defined
+      - item.rc | int != 0
+    fail_msg: >-
+      {{ item.item }} is still installed on {{ inventory_hostname }}; installing PSMDB over it
+      fails on a file conflict while mongod is stopped. Do not continue — re-run the removal.
+    quiet: true
+  loop: "{{ community_gone.results | default([]) }}"
+
+- name: "Upgrade | {{ hop }} | install pinned PSMDB package"
+  ansible.builtin.command:
+    argv: [dnf, -y, install, "{{ hop_info.package }}"]
+  register: pkg_install
+  changed_when: "'Nothing to do' not in pkg_install.stdout"
+
+# The whole rollback plan assumes the exact pinned build. dnf will happily satisfy the request
+# with a different build if the pin is not available, so the installed NVR is asserted, not assumed.
+- name: "Upgrade | {{ hop }} | read the installed PSMDB version"
+  ansible.builtin.command:
+    argv: [rpm, -q, "--qf", "%{VERSION}-%{RELEASE}", "percona-server-mongodb"]
+  register: psmdb_installed
+  changed_when: false
+
+- name: "Upgrade | {{ hop }} | the installed build must be exactly the pinned one"
+  ansible.builtin.assert:
+    that:
+      - psmdb_installed.rc is defined
+      - psmdb_installed.rc | int == 0
+      - psmdb_installed.stdout | trim == (hop_info.package | regex_replace('^percona-server-mongodb-', ''))
+    fail_msg: >-
+      Expected {{ hop_info.package }} on {{ inventory_hostname }}, found
+      "{{ psmdb_installed.stdout | default('(not installed)') | trim }}". The rollback path and
+      the FCV gates are pinned to that build — stop and reconcile before restarting mongod.
+    quiet: true
+
+- name: "Upgrade | {{ hop }} | restore config (the package replaces /etc/mongod.conf)"
+  ansible.builtin.copy:
+    src: "{{ staged_config_dir }}/{{ conf_file | basename }}.{{ expected_prev_major }}to{{ hop }}.bak"
+    dest: "{{ conf_file }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: "Upgrade | {{ hop }} | systemd PIDFile drop-in (guardrail G3)"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/mongod.service.d/pidfile.conf
+    content: |
+      [Service]
+      PIDFile=/var/run/mongodb/mongod.pid
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: "Upgrade | {{ hop }} | reload systemd"
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# Removing mongodb-org-server can drop and recreate the mongod user with a different uid, while
+# the data files keep the OLD numeric owner. Check before paying for a recursive chown.
+- name: "Upgrade | {{ hop }} | did the mongod uid change under the data directory?"
+  ansible.builtin.shell: |
+    want=$(id -u mongod)
+    have=$(stat -c %u "{{ db_path }}")
+    echo "want=$want have=$have"
+    if [ "$want" = "$have" ]; then echo SAME; else echo DIFFERENT; fi
+  register: uid_check
+  changed_when: false
+  check_mode: false
+
+- name: "Upgrade | {{ hop }} | recursive chown only when the uid actually moved"
+  ansible.builtin.command:
+    argv: [chown, -R, mongod:mongod, "{{ db_path }}"]
+  when: "'DIFFERENT' in uid_check.stdout"
+
+- name: "Upgrade | {{ hop }} | log directory must exist and belong to mongod"
+  ansible.builtin.file:
+    path: "{{ system_log | dirname }}"
+    state: directory
+    owner: mongod
+    group: mongod
+    mode: "0755"
+
+- name: "Upgrade | {{ hop }} | keyfile ownership"
+  ansible.builtin.file:
+    path: "{{ key_file }}"
+    state: file
+    owner: mongod
+    group: mongod
+    mode: "0600"
+
+# No mode here: the data directory's existing permissions are not this change's business.
+- name: "Upgrade | {{ hop }} | data directory ownership (non-recursive)"
+  ansible.builtin.file:
+    path: "{{ db_path }}"
+    state: directory
+    owner: mongod
+    group: mongod
+
+- name: "Upgrade | {{ hop }} | start mongod"
+  ansible.builtin.systemd:
+    name: mongod
+    state: started
+    enabled: true
+
+- name: "Upgrade | {{ hop }} | 8.0 first start is slow — wait for the port to accept connections"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', '1'] }}"
+  register: startup_probe
+  changed_when: false
+  check_mode: false
+  no_log: true
+  until: startup_probe.rc == 0
+  retries: 40
+  delay: 10
+  failed_when: false
+
+- name: "Upgrade | {{ hop }} | fail if mongod never came up"
+  ansible.builtin.assert:
+    that:
+      - startup_probe.rc == 0
+    fail_msg: >-
+      mongod on {{ inventory_hostname }} did not accept connections within ~7 min after the
+      {{ hop }} start. Check `journalctl -u mongod -n 200`. Rollback: reinstall the staged RPM
+      set from {{ rpm_stage_dir }}-{{ expected_prev_major }} and restore the .bak config.
+    quiet: true
+
+- name: "Upgrade | {{ hop }} | verify the new build is Percona {{ hop }}"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify({v:db.version(),psmdb:db.runCommand({buildInfo:1}).psmdbVersion})'] }}"
+  register: post_build
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: "Upgrade | {{ hop }} | the binary must now be Percona {{ hop }}"
+  ansible.builtin.assert:
+    that:
+      - (post_build.stdout | from_json).v is search('^' ~ (hop | regex_escape))
+      - (post_build.stdout | from_json).psmdb is defined
+    fail_msg: >-
+      Expected Percona {{ hop }} after install, got {{ post_build.stdout | default('no output') }}.
+      Do not continue — a community build on a Percona hop breaks the next one.
+    quiet: true
+
+- name: "Upgrade | {{ hop }} | this node must be back in service before the next node is touched (guardrail G7)"
+  ansible.builtin.include_tasks: wait-member-synced.yml
+  vars:
+    # A restarted member always returns as SECONDARY. Re-election of the priority-2
+    # member is verified separately by the calling playbook.
+    expected_state: 2
+    max_lag_sec: 10

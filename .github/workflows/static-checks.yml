@@ -1,0 +1,38 @@
+name: static checks
+
+# No host is contacted and no credential is needed: this validates that the tree is internally
+# consistent (YAML parses, every template renders, every gate's string can actually match real
+# output) and that nothing secret has been committed.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Pinned deliberately: ansible-core 2.22 requires Python >= 3.13, and the nodes this project
+      # targets ship 3.12 at best. See docs/CONTROL-NODE.md §3.
+      - name: Install ansible-core
+        run: pip install "ansible-core==2.21.6"
+
+      - name: Syntax-check every playbook
+        run: |
+          for p in playbooks/*.yml; do
+            echo "::group::$p"
+            ansible-playbook -i inventory/prod-live.yml --syntax-check "$p"
+            echo "::endgroup::"
+          done
+
+      - name: Static audit (module args, template scope, bad literals, doc↔gate)
+        run: ./scripts/audit.sh
+
+      - name: Leak scan (keys, vault files, real-looking IPs, credentials)
+        run: ./scripts/leak-scan.sh

@@ -1,0 +1,31 @@
+# ── Secrets: never commit ───────────────────────────────────────────────────────
+# Ansible only loads group_vars that match the group name: <group>.yml, or ANY file inside <group>/.
+# A sibling file called <group>.vault.yml is treated as vars for a group "<group>.vault" and is
+# SILENTLY IGNORED — which leaves credentials unset with no error.
+inventory/group_vars/prod_live/vault.yml
+group_vars/prod_live/vault.yml
+*.vault.yml
+!*.vault.yml.example
+
+# ── PKI and key material ────────────────────────────────────────────────────────
+artifacts/tls/
+*.pem
+*.key
+*.crt
+*.csr
+*.srl
+!*.crt.example
+
+# ── Run output: fingerprints, manifests, reports, FCBIS evidence ─────────────────
+artifacts/
+
+# ── Local scratch ──────────────────────────────────────────────────────────────
+collections/
+.venv-check/
+.venv/
+migration-logs/
+ansible-*.log
+screen-*.log
+.DS_Store
+__pycache__/
+*.pyc

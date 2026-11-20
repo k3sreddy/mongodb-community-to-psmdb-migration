@@ -1,0 +1,44 @@
+---
+# Connection + credential wiring. Secrets come from the vault file only.
+
+# The nodes are Rocky 8.7/8.8, whose default /usr/bin/python3 is 3.6.8. ansible-core 2.22
+# module payloads start with `from __future__ import annotations`, which is a SyntaxError on
+# 3.6 — every module fails with "future feature annotations is not defined". /usr/bin/python3.12
+# is present on all three nodes (verified 2026-11-19). Do NOT "simplify" this back to python3.
+# Consequence, also verified: the `dnf` python bindings exist only for platform-python 3.6, so
+# `ansible.builtin.dnf` cannot work on these hosts at all — packages are driven with
+# `command: dnf ...` plus an rpm-based verification instead (tasks/node-upgrade.yml).
+ansible_python_interpreter: /usr/bin/python3.12
+ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"
+
+mongo_admin_user: admin
+mongo_auth_db: admin
+# '__UNSET__' means the vault file was never created — preflight-common.yml refuses to run.
+mongo_admin_password: "{{ vault_mongo_admin_password | default('__UNSET__') }}"
+
+# Which mongo shell to drive. mongosh is REQUIRED for the migration (the legacy `mongo`
+# binary disappears from the filesystem when the community 5.0 packages are removed), but the
+# read-only baseline in 00-preflight must be able to run on a node that still only has `mongo`.
+# tasks/preflight-common.yml probes both and sets `mongo_shell`; anything that mutates a node
+# asserts mongo_shell == 'mongosh' first.
+mongo_shell: mongosh
+
+# Per-node local shell argv (used for every node-scoped read/diagnostic).
+# `--norc` is legacy-shell-only: mongosh does not accept it. Passing an unknown option makes
+# the shell exit non-zero, so the flag is added conditionally rather than unconditionally.
+mongo_base_argv: >-
+  {{ ([mongo_shell] + (['--norc'] if mongo_shell == 'mongo' else [])
+      + ['--quiet',
+         '--username', mongo_admin_user,
+         '--password', mongo_admin_password,
+         '--authenticationDatabase', mongo_auth_db]) }}
+
+# Cluster-wide argv: the driver discovers the current primary itself, so commands
+# that must run "on the primary" never hard-code a host.
+mongo_rs_argv:
+  - "{{ mongo_shell }}"
+  - --quiet
+  - --norc
+  - "mongodb://{{ mongo_admin_user }}:{{ mongo_admin_password }}@{{ groups['prod_live'] | map('extract', hostvars, 'ansible_host') | join(':27017,') }}:27017/?replicaSet={{ replset_name }}&authSource={{ mongo_auth_db }}"
+
+artifact_dir: "{{ playbook_dir }}/../artifacts"

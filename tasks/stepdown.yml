@@ -1,0 +1,39 @@
+---
+# Step the current primary down and wait until another member is primary.
+# Must run on the host that is currently PRIMARY, before it is restarted.
+- name: "Stepdown | ask the primary to step down (graceful, guardrail G2)"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify(rs.stepDown(' ~ (stepdown_seconds | default(300)) ~ '))'] }}"
+  register: stepdown_out
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: "Stepdown | confirm this node is no longer primary and a peer took over"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval',
+              'const st=rs.status();JSON.stringify({me:st.members.filter(m=>m.self)[0].state,primaries:st.members.filter(m=>m.state===1).length})'] }}"
+  register: after_stepdown
+  changed_when: false
+  check_mode: false
+  no_log: true
+  until:
+    - (after_stepdown.stdout | from_json).me == 2
+    - (after_stepdown.stdout | from_json).primaries == 1
+  retries: 12
+  delay: 5
+  failed_when: false
+
+- name: "Stepdown | abort if no new primary was elected"
+  ansible.builtin.assert:
+    that:
+      - (after_stepdown.stdout | from_json).me == 2
+      - (after_stepdown.stdout | from_json).primaries == 1
+    fail_msg: >-
+      No new PRIMARY was elected after stepDown on {{ inventory_hostname }}
+      ({{ after_stepdown.stdout | default('no output') }}). STOP — touch nothing.
+    quiet: true
+
+- name: "Stepdown | give the new primary a moment to settle"
+  ansible.builtin.pause:
+    seconds: 10

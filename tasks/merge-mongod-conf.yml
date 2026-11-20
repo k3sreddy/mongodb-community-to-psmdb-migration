@@ -1,0 +1,55 @@
+---
+# Merge keys into /etc/mongod.conf safely (YAML-aware, comment-preserving is NOT guaranteed —
+# the file is backed up first and diffed in the task output).
+# Input: conf_merge (dict), conf_label (string for backup filename), conf_gate (list of
+#        command-line greps that must pass afterwards).
+- name: "{{ conf_label }} | back up mongod.conf"
+  ansible.builtin.copy:
+    src: "{{ conf_file }}"
+    dest: "{{ staged_config_dir }}/mongod.conf.{{ conf_label }}.bak"
+    remote_src: true
+    mode: "0600"
+    force: false            # keep the FIRST pre-change copy, never overwrite it on re-runs
+
+- name: "{{ conf_label }} | read current config"
+  ansible.builtin.slurp:
+    src: "{{ conf_file }}"
+  register: conf_raw
+
+- name: "{{ conf_label }} | merge new keys"
+  ansible.builtin.set_fact:
+    mongo_conf_merged: "{{ (conf_raw.content | b64decode | from_yaml) | combine(conf_merge, recursive=True) }}"
+
+- name: "{{ conf_label }} | write merged config"
+  ansible.builtin.copy:
+    content: "{{ mongo_conf_merged | to_nice_yaml(indent=2, width=4096) }}"
+    dest: "{{ conf_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  register: conf_written
+
+- name: "{{ conf_label }} | re-read the written config"
+  ansible.builtin.slurp:
+    src: "{{ conf_file }}"
+  register: conf_written_back
+
+- name: "{{ conf_label }} | the result must parse and carry the merged keys"
+  ansible.builtin.set_fact:
+    conf_parsed: "{{ conf_written_back.content | b64decode | from_yaml }}"
+
+- name: "{{ conf_label }} | config integrity gate"
+  ansible.builtin.assert:
+    that:
+      - conf_parsed is mapping
+      - conf_merge.keys() | list | difference(conf_parsed.keys() | list) | length == 0
+    fail_msg: >-
+      The rewritten {{ conf_file }} does not parse or lost a merged section. Restore
+      {{ staged_config_dir }}/{{ conf_file | basename }}.{{ conf_label }}.bak immediately.
+    quiet: true
+
+- name: "{{ conf_label }} | show diff"
+  ansible.builtin.debug:
+    var: conf_written.diff
+  when: conf_written.diff is defined and conf_written.diff | length > 0

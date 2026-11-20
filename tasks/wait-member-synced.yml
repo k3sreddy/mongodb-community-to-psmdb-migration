@@ -1,0 +1,76 @@
+---
+# Poll until this member is in service and caught up. Read-only.
+#
+# Vars:
+#   expected_state : 1 (PRIMARY) or 2 (SECONDARY). OMIT to accept either — use that when a
+#                    priority-2 member is expected to re-elect itself while we are checking
+#                    (03 leg 3, TLS restart of the primary). A hard "must be SECONDARY" there
+#                    is a race the member wins, and the leg then fails after 15 min.
+#   max_lag_sec    : default 10
+#   skip_lag_check : default false. Set true ONLY for a TLS rollout, where replication legitimately
+#                    stalls until the last member is restarted (see the note below).
+#   wait_retries   : default 60 polls (60 × 15 s = 15 min) — enough for a restart.
+#                    A wipe + initial sync of ~0.8 TB is 1–3 h: the encryption legs pass
+#                    wait_retries: 960 (4 h) explicitly.
+#   wait_delay     : default 15
+- name: "Wait | resolve the acceptable state(s) and the polling budget"
+  ansible.builtin.set_fact:
+    wait_states: "{{ [expected_state | int] if (expected_state is defined and expected_state | string | length > 0) else [1, 2] }}"
+    wait_retries_eff: "{{ wait_retries | default(60) | int }}"
+    wait_delay_eff: "{{ wait_delay | default(15) | int }}"
+    # skip_lag_check exists for one case only: a TLS rollout. `preferTLS` uses TLS for OUTBOUND
+    # connections, so a member that has been restarted cannot open a replication connection to a
+    # peer that has not been restarted yet. Replication stalls until the last member is done —
+    # which is expected and must not abort the rollout. Full catch-up is asserted afterwards.
+    wait_lag_eff: "{{ 999999 if (skip_lag_check | default(false) | bool) else (max_lag_sec | default(10) | int) }}"
+
+- name: "Wait | {{ inventory_hostname }} must answer on the wire"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', '1'] }}"
+  register: wait_probe
+  changed_when: false
+  check_mode: false
+  no_log: true
+  until: wait_probe.rc == 0
+  retries: 60
+  delay: 10
+  failed_when: false
+
+- name: "Wait | {{ inventory_hostname }} must be back in service before the next node is touched (guardrail G7)"
+  ansible.builtin.assert:
+    that:
+      - wait_probe.rc == 0
+    fail_msg: >-
+      {{ inventory_hostname }} never accepted connections again (waited 10 min). STOP THE RUN —
+      do not touch another member. Check `journalctl -u mongod -n 200` and the .bak config.
+    quiet: true
+
+- name: "Wait | poll replica state and lag"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval',
+              'const st=rs.status();const me=st.members.filter(m=>m.self)[0];const p=st.members.filter(m=>m.state===1)[0];const lag=(p&&me.optimeDate&&p.optimeDate)?Math.round((p.optimeDate-me.optimeDate)/1000):9999;JSON.stringify({state:me.state,health:me.health,lagSec:lag,primary:(me.state===1)})'] }}"
+  register: wait_state
+  changed_when: false
+  check_mode: false
+  no_log: true
+  until:
+    - (wait_state.stdout | from_json).state in wait_states
+    - (wait_state.stdout | from_json).health == 1
+    - (wait_state.stdout | from_json).lagSec | int <= (wait_lag_eff | int)
+  retries: "{{ wait_retries_eff | int }}"
+  delay: "{{ wait_delay_eff | int }}"
+  failed_when: false
+
+- name: "Wait | fail loudly if the member did not converge"
+  ansible.builtin.assert:
+    that:
+      - (wait_state.stdout | from_json).state in wait_states
+      - (wait_state.stdout | from_json).health == 1
+      - (wait_state.stdout | from_json).lagSec | int <= (wait_lag_eff | int)
+    fail_msg: >-
+      {{ inventory_hostname }} did not reach state {{ wait_states | join(' or ') }} with lag
+      <= {{ wait_lag_eff | int }}s within
+      {{ ((wait_retries_eff | int) * (wait_delay_eff | int) / 60) | round(0) }} min
+      (last: {{ wait_state.stdout | default('no output') }}).
+      STOP THE RUN. Do not proceed to the next node.
+    quiet: true

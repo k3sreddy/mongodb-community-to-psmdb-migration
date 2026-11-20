@@ -1,0 +1,27 @@
+---
+# PROD LIVE replica set — db-node-1/2/3.
+# HARD RULE: this inventory contains exactly the three LIVE members and nothing else.
+# The second cluster (10.0.0.21/22/23) shares the replica set name rs0
+# and MUST live in a different inventory/project, never here.
+all:
+  children:
+    prod_live:
+      hosts:
+        mongo1:
+          ansible_host: 10.0.0.11   # db-node-1  — SECONDARY
+        mongo2:
+          ansible_host: 10.0.0.12   # db-node-2  — PRIMARY (priority 2) at plan time
+        mongo3:
+          ansible_host: 10.0.0.13   # db-node-3 — SECONDARY
+      vars:
+        ansible_user: root
+        # Prefer SSH keys. The fallback password lives only in the vault file.
+        ansible_password: "{{ vault_ansible_password | default(omit) }}"
+        ansible_become: false
+
+    # Empty shells — playbooks/02-upgrade.yml populates them at runtime with add_host
+    # so the primary is always handled last. Do not put hosts here by hand.
+    prod_live_primary:
+      hosts: {}
+    prod_live_secondary:
+      hosts: {}

@@ -1,0 +1,173 @@
+---
+# ── Cluster identity ────────────────────────────────────────────────────────────
+cluster_id: prod-live
+cluster_label: "PRODUCTION — db-node-1/2/3"
+replset_name: rs0
+mongo_port: 27017
+
+# Hard allow-list. Every playbook asserts its target is in here (guardrail G1b).
+allowed_member_ips:
+  - 10.0.0.11
+  - 10.0.0.12
+  - 10.0.0.13
+allowed_member_names:
+  - mongo1
+  - mongo2
+  - mongo3
+
+# The look-alike second set. Never a target, never a member of this set.
+forbidden_member_ips:
+  - 10.0.0.21
+  - 10.0.0.22
+  - 10.0.0.23
+
+# ── Paths ───────────────────────────────────────────────────────────────────────
+db_path: /DATA/mongo
+data_mount: /DATA
+conf_file: /etc/mongod.conf
+# Measured on all three members 2026-11-19: the running keyFile is NOT /etc/mongod.key.
+# 00-preflight asserts this matches what /etc/mongod.conf actually says, so drift fails loudly.
+key_file: /etc/mongodb/keyFiles/mongo-key
+system_log: /var/log/mongodb/mongod.log
+audit_log: /var/log/mongodb/audit.log
+nfs_backup_dir: /mnt/mongo-nfs
+backup_dir: "{{ nfs_backup_dir }}/prod-live"
+rpm_stage_dir: /root/rpm-stage
+staged_config_dir: /root
+
+# ── Version path (mirrors the previously completed migration so all clusters match) ──
+# Verify each NEVRA with: dnf --showduplicates list percona-server-mongodb
+expected_start_major: "5.0"          # running build at plan time: community 5.0.8
+target_major: "8.0"
+upgrade_hops:
+  - major: "6.0"
+    previous_major: "5.0"        # the binary/FCV you must be on before this hop
+    repo: psmdb-60
+    package: "percona-server-mongodb-6.0.29-23"
+    fcv_confirm: false
+  - major: "7.0"
+    previous_major: "6.0"
+    repo: psmdb-70
+    package: "percona-server-mongodb-7.0.40-22"
+    fcv_confirm: true
+  - major: "8.0"
+    previous_major: "7.0"
+    repo: psmdb-80
+    package: "percona-server-mongodb-8.0.29-13"
+    fcv_confirm: true
+psmdb_repos: [psmdb-60, psmdb-70, psmdb-80]
+obsolete_repos: [psmdb-50]
+
+# ── Capacity / rollback gates ───────────────────────────────────────────────────
+min_nfs_free_gb: 10           # 00: the key DR copy only — no backup archive is written by this change
+min_nfs_backup_free_gb: 2000  # 01 (OPTIONAL, not part of this change): a full dump needs ~2 TB
+min_data_free_pct: 25         # a wipe+resync must never run on a nearly-full volume
+min_data_free_gb: 300         # absolute floor, in addition to the percentage
+rpm_stage_min_count: 4        # Phase-1 rollback is only real if the installed RPMs are on disk
+
+# Fingerprint comparison tolerance. Two members sampled seconds apart on a busily-written
+# cluster CANNOT agree exactly: measured 2026-11-19, the two LIVE secondaries differed by
+# 9,696 documents out of 1,169,651,958 (8 ppm) while both were healthy and fully in sync.
+# Exact equality therefore fails every run and proves nothing; a wide tolerance hides a real
+# divergence. 0.05% (or 250k documents, whichever is larger) sits well above write traffic and
+# far below any meaningful data loss. Replication optime lag remains the authoritative
+# "is this member behind" check — this tolerance only covers the completeness question.
+fingerprint_max_abs_delta: 250000
+fingerprint_max_rel_pct: 0.05
+# Per-DATABASE gate, separate from the total. Totals alone are too coarse: 0.05% of this cluster is
+# 585k documents, so losing a 300k-document collection would pass. Each database is compared on its
+# own with a much tighter rule — 100k absolute floor or 0.01%, whichever is larger.
+#
+# Both numbers are sized from measurement, not taste (2026-11-20, mongo1 + mongo3, live cluster):
+#   * two IMMEDIATE CONSECUTIVE fingerprints on the SAME member differ by up to 37,229 documents in a
+#     single database (and 38,375 in the total) — `collStats.count` on a secondary is not a snapshot;
+#   * the two secondaries, sampled at one moment, differ by at most 7,627 per database.
+# So a per-database tolerance below ~40k would fail on noise alone. 100k is 2.7x the worst measured
+# noise and still flags a 150k-document loss, which the total gate (585k) would not.
+#
+# HONEST DETECTION FLOOR of this method: roughly 100k documents in one database, 250k in total.
+# Anything smaller is below its resolution. That is why the database-set identity check, replica
+# health, optime lag and the per-leg "resyncing member reached SECONDARY" gate exist alongside it.
+fingerprint_db_max_abs_delta: 100000
+fingerprint_db_max_rel_pct: 0.01
+mongo_bin: /usr/bin/mongod    # copied aside per node before the package swap
+
+# ── At-rest encryption ──────────────────────────────────────────────────────────
+encryption_key_file: /etc/mongo-enc.key
+encryption_cipher: AES256-GCM
+encryption_key_bytes: 32     # RAW 32 bytes. Hex text is rejected by PSMDB.
+# Order matters: first leg must be LOGICAL (only unencrypted source available),
+# every later leg is FCBIS from an already-encrypted member. Primary goes last.
+encrypt_sequence:
+  - { host: mongo3, method: logical }
+  - { host: mongo1, method: fcbis, source: mongo3 }
+  - { host: mongo2, method: fcbis, source: mongo3 }
+# A wipe + initial sync of ~0.8 TB takes 1–3 h. The default wait budget (15 min) is for a
+# restart, not a resync — the encryption legs use these instead.
+resync_wait_retries: 960      # 960 × 15 s = 4 h
+resync_wait_delay: 15
+
+# ── FCBIS tuning — written on legs 2 and 3 ONLY ─────────────────────────────────
+# Every name below was confirmed REGISTERED in /usr/bin/mongod v8.0.29-13 (10.0.0.21,
+# 2026-11-20) by inspecting the binary. That check matters because an unregistered setParameter
+# makes mongod REFUSE TO START — and in a leg that happens after the dbPath has been wiped.
+#
+# Percona defaults are sized for a 500 GB cluster that is not busy. This one is 684 GB under a
+# sustained write load, and the syncing node must ALSO apply the oplog backlog it accumulated
+# during the copy. With the default 300 s / 3 cycles the leg aborts and the window is lost.
+fcbis_max_lag_sec: 1800                  # default 300
+fcbis_max_cycles_without_progress: 10    # default 3
+fcbis_source_read_pref: secondary
+
+# The exact strings the 8.0.29 binary logs, taken from the binary itself (strings /usr/bin/mongod).
+# NOTE THE HYPHEN in the first one: an earlier draft of tasks/encrypt-leg.yml grepped
+# "File copy based initial sync" (no hyphen), which matches nothing on any build — a gate that
+# silently reads zero forever. scripts/audit.py check 13 now rejects that literal.
+fcbis_log_marker: "File copy-based initial sync"                                    # positive
+fcbis_log_token: "FCBIS"                                                            # positive
+fcbis_log_fallback: "Falling back to logical initial sync"                           # NEGATIVE
+fcbis_log_no_support: "Support for the file copy-based"                              # NEGATIVE (build lacks it)
+fcbis_log_bad_source: "sync source does not support file copy-based initial sync"    # NEGATIVE
+
+# ── TLS (phase 3) ───────────────────────────────────────────────────────────────
+tls_dir: /etc/mongo-tls
+tls_cert: "{{ tls_dir }}/server.pem"
+tls_ca: "{{ tls_dir }}/ca.crt"
+tls_mode: preferTLS          # END STATE of this change: TLS accepted AND plaintext accepted.
+                             # requireTLS is a separate change (needs every app on tls=true).
+tls_cert_src_dir: "{{ playbook_dir | dirname }}/artifacts/tls"   # written by scripts/issue-certs.sh
+
+# ── Verification helpers ────────────────────────────────────────────────────────
+# Per-DB document-count fingerprint (guardrail G6). Kept here as a block scalar so the
+# quotes inside the JavaScript never collide with YAML/Jinja quoting.
+#
+# Two things here are load-bearing, both measured 2026-11-19 against the live secondaries:
+#   * setSecondaryOk BEFORE any admin command. `listDatabases` is primary-only; on a secondary
+#     it returns {ok:0, errmsg:"not master and slaveOk=false"} — a document with no .databases —
+#     and the old JS then threw "TypeError: ....databases is undefined" and exited non-zero.
+#     The fingerprint deliberately runs on secondaries (never load the primary), so without
+#     this the gate can never produce a number.
+#   * collStats.count, NOT countDocuments({}). collStats reads the WiredTiger table count and
+#     completes in ~5 s; countDocuments does a full aggregation scan, and this cluster holds
+#     1,169,641,970 documents across 35 databases (orders alone: 460 M). The
+#     fingerprint is taken before AND after every encryption leg, so the difference is
+#     minutes vs. hours per run.
+fingerprint_js: |
+  try { db.getMongo().setSecondaryOk(); } catch (e) { try { db.getMongo().setSlaveOk(); } catch (e2) {} }
+  const skip=['admin','local','config'];
+  const out={}; let total=0;
+  db.adminCommand({listDatabases:1}).databases
+    .filter(d=>skip.indexOf(d.name)===-1)
+    .forEach(d=>{
+      const s=db.getSiblingDB(d.name); let n=0;
+      s.getCollectionNames().forEach(c=>{
+        try { n += s.runCommand({collStats:c}).count; } catch(e) {}
+      });
+      out[d.name]=n; total+=n;
+    });
+  print(JSON.stringify({total:total,perDb:out}));
+
+# ── Audit / retention (matches the reference cluster policy) ──────────────────────────────────
+audit_enabled: true
+log_rotate_trigger_bytes: 1073741824     # 1 GiB
+log_retention_days: 7

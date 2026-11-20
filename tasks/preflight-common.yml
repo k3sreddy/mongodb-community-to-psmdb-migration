@@ -1,0 +1,183 @@
+---
+# Shared pre-flight. Read-only. Included at the top of every playbook.
+# Sets: mongo_hello, mongo_rs_status, mongo_build, mongo_fcv
+
+- name: Preflight | target must belong to the LIVE set (guardrail G1b)
+  ansible.builtin.assert:
+    that:
+      - ansible_host is defined
+      - ansible_host in allowed_member_ips
+      - ansible_host not in forbidden_member_ips
+    fail_msg: >-
+      REFUSING TO RUN. {{ inventory_hostname }} ({{ ansible_host | default('?') }}) is not a
+      member of the LIVE set {{ allowed_member_ips }}. The second cluster 10.0.0.21-23
+      shares the replica set name "{{ replset_name }}" and must never be touched from this project.
+    quiet: true
+
+- name: Preflight | which mongo shell exists (mongosh wins; legacy mongo is a read-only fallback)
+  ansible.builtin.shell: |
+    if command -v mongosh >/dev/null 2>&1; then echo mongosh
+    elif command -v mongo >/dev/null 2>&1; then echo mongo
+    else echo NONE; fi
+  args:
+    executable: /bin/bash
+  register: shell_probe
+  changed_when: false
+  check_mode: false
+
+- name: Preflight | a shell must exist
+  ansible.builtin.assert:
+    that:
+      - shell_probe.stdout | trim in ['mongosh', 'mongo']
+    fail_msg: "{{ inventory_hostname }}: neither mongosh nor mongo is installed — cannot read the database."
+    quiet: true
+
+- name: Preflight | record the shell and its version
+  ansible.builtin.set_fact:
+    mongo_shell: "{{ shell_probe.stdout | trim }}"
+
+- name: Preflight | shell version
+  ansible.builtin.command: "{{ mongo_shell }} --version"
+  register: mongosh_version
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Preflight | the shell must be runnable
+  ansible.builtin.assert:
+    that:
+      - mongosh_version.rc is defined
+      - mongosh_version.rc | int == 0
+      - mongosh_version.stdout | default('') | length > 0
+    fail_msg: >-
+      {{ mongo_shell }} --version failed on {{ inventory_hostname }}
+      (rc={{ mongosh_version.rc | default('?') }}, {{ mongosh_version.stderr | default('') | truncate(160) }}).
+    quiet: true
+
+# Anything that MUTATES a node runs after the community packages are removed, and the legacy
+# `mongo` binary is owned by those packages — it is gone at that point. So every mutating
+# playbook sets require_mongosh: true; 00-preflight deliberately does not, so the read-only
+# baseline can still be captured on a cluster that has only the legacy shell.
+- name: Preflight | mongosh is required for anything that changes a node
+  ansible.builtin.assert:
+    that:
+      - mongo_shell == 'mongosh'
+    fail_msg: >-
+      {{ inventory_hostname }} only has the legacy `mongo` shell. The migration removes the
+      community packages that own it, so every step after the first package swap would fail.
+      Install mongosh first: ansible-playbook playbooks/00b-bootstrap.yml (README §5A).
+    quiet: true
+  when: require_mongosh | default(false) | bool
+
+- name: Preflight | credentials must come from the vault, not from a default
+  ansible.builtin.assert:
+    that:
+      - mongo_admin_password not in ['__UNSET__', 'REPLACE_ME']
+    fail_msg: >-
+      vault_mongo_admin_password is unset or still the REPLACE_ME placeholder. The real secrets
+      live in inventory/group_vars/prod_live/vault.yml (create it from the .example and encrypt
+      with ansible-vault, README §9). Ansible ignores that file entirely if it is placed beside
+      prod_live/ instead of inside it — the symptom is a credential that silently resolves to
+      nothing, with no error.
+    quiet: true
+
+- name: Preflight | read member identity
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify(db.hello())'] }}"
+  register: hello_raw
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Preflight | record identity
+  ansible.builtin.set_fact:
+    mongo_hello: "{{ hello_raw.stdout | from_json }}"
+
+# Cluster identity is asserted on RESOLVED IPs, not on hostnames. The LIVE set's members are
+# named `mongo1`, `mongo2` and `db-node-3` (mixed /etc/hosts aliases, inherited legacy), while the
+# second set on 10.0.0.21-23 is named `mongo4/5/6`. A hostname allow-list therefore both rejects the
+# real cluster and is a weak discriminator; resolving each member and comparing the IP set is
+# exact, and catches the look-alike set regardless of how its members are named.
+- name: Preflight | resolve each replica-set member to an IPv4 address (guardrail G1)
+  ansible.builtin.shell: |
+    set -o pipefail
+    getent ahostsv4 {{ item | regex_replace(':.*$', '') | quote }} | awk 'NR==1{print $1}'
+  args:
+    executable: /bin/bash
+  loop: "{{ mongo_hello.hosts }}"
+  register: member_dns
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+# ahostsv4, not `getent hosts`: on a node whose own name resolves to an IPv6 link-local
+# address (verified on mongo3/db-node-3), `getent hosts` returns fe80::… and the comparison
+# against the IPv4 allow-list fails for the right reason but the wrong cause.
+#
+# The replica set's member names are NOT the inventory names: the LIVE set is named
+# mongo1 / mongo2 / db-node-3. Anything that matches a member inside rs.status()/rs.conf()
+# must therefore resolve an inventory host to its set name, which is what rs_member_by_ip
+# is for. Comparing inventory names directly silently matches nothing.
+- name: Preflight | record resolved member IPs and their replica-set names
+  ansible.builtin.set_fact:
+    rs_member_by_ip: >-
+      {{ dict(member_dns.results | selectattr('stdout', 'defined')
+              | selectattr('stdout', 'ne', '')
+              | map(attribute='stdout') | map('trim')
+              | zip(member_dns.results | selectattr('stdout', 'defined')
+                    | selectattr('stdout', 'ne', '')
+                    | map(attribute='item') | map('regex_replace', ':.*$', '') | list)) }}
+    member_ips: >-
+      {{ member_dns.results | map(attribute='stdout') | map('trim') | select | list | sort }}
+
+- name: Preflight | replica set identity and membership (guardrail G1)
+  ansible.builtin.assert:
+    that:
+      - mongo_hello.setName == replset_name
+      - mongo_hello.hosts | length == 3
+      - member_ips | length == 3
+      - member_ips == allowed_member_ips | sort
+      - ansible_host in member_ips
+      - member_ips | intersect(forbidden_member_ips) | length == 0
+    fail_msg: >-
+      Replica set mismatch on {{ inventory_hostname }} ({{ ansible_host }}): setName={{ mongo_hello.setName }},
+      hosts={{ mongo_hello.hosts }} -> IPs {{ member_ips }} — expected {{ replset_name }} on
+      {{ allowed_member_ips | sort }}. STOP: this is the wrong cluster
+      (the second set on {{ forbidden_member_ips }} shares the replica set name), or the set is
+      not in its documented topology. An empty IP means a member hostname does not resolve on
+      this node.
+    quiet: true
+
+- name: Preflight | read replica set status
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify(rs.status())'] }}"
+  register: rsstatus_raw
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Preflight | record replica set status
+  ansible.builtin.set_fact:
+    mongo_rs_status: "{{ rsstatus_raw.stdout | from_json }}"
+
+- name: Preflight | read build info and FCV
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify({build: db.runCommand({buildInfo:1}), fcv: db.adminCommand({getParameter:1, featureCompatibilityVersion:1}).featureCompatibilityVersion})'] }}"
+  register: build_raw
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Preflight | record build info and FCV
+  ansible.builtin.set_fact:
+    mongo_build: "{{ (build_raw.stdout | from_json).build }}"
+    mongo_fcv: "{{ (build_raw.stdout | from_json).fcv }}"
+
+- name: Preflight | every member must be healthy (no degraded set is ever modified)
+  ansible.builtin.assert:
+    that:
+      - mongo_rs_status.members | selectattr('health', 'equalto', 1) | list | length == 3
+    fail_msg: >-
+      Replica set is not fully healthy on {{ inventory_hostname }}. Fix replication first;
+      never migrate a degraded set.
+    quiet: true
