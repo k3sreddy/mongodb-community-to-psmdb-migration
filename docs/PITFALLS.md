@@ -230,3 +230,31 @@ verified healthy and fingerprint-identical before each wipe, and why "we'll take
 a plan you want to invent at 03:00.
 
 Decide that before the window, record it, and have someone other than the operator sign it.
+
+---
+
+## 17. `featureCompatibilityVersion` is a **document**, not a string — so `| string` never matches
+
+**Symptom.** A gate that has always worked suddenly reports "hop not complete" on a member that upgraded
+perfectly — or, worse, an FCV comparison silently never matches and the gate reads as `false` forever.
+
+**Cause.** `db.adminCommand({getParameter: 1, featureCompatibilityVersion: 1})` answers with
+`{ featureCompatibilityVersion: { version: "5.0" }, ok: 1 }` on current builds — confirmed against a live
+5.0.8 server, not inferred from the docs. Render that value in Jinja or templating and `| string` gives you
+`{'version': '5.0'}`, which no `^5\.0` pattern will ever match. It is also easy to miss in a rehearsal,
+because read-only preflight does not usually compare the FCV: the failure lands on the **first upgrade hop**,
+after the packages have already been swapped.
+
+**Guard.** Normalise once, keep the raw value for evidence, and assert the shape:
+
+```yaml
+mongo_fcv_raw: "{{ (build_raw.stdout | from_json).fcv }}"
+mongo_fcv: "{{ mongo_fcv_raw.version if (mongo_fcv_raw is mapping) else mongo_fcv_raw }}"
+```
+
+Then every comparison uses `mongo_fcv`. Two related traps while you are there:
+- a **resume** must be allowed to re-run the hop it is half-way through, so compare with set membership
+  (`in [previous_major, hop]`), not equality — otherwise an interrupted window can only be recovered by
+  doing the unsafe thing (skipping ahead);
+- an FCV can never legitimately be **ahead** of the running binary, so `fcv_major | float <= binary_major |
+  float` is a cheap, high-value assertion.

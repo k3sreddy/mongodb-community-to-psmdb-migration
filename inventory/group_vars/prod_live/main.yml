@@ -6,14 +6,16 @@ replset_name: rs0
 mongo_port: 27017
 
 # Hard allow-list. Every playbook asserts its target is in here (guardrail G1b).
+# IPs only, deliberately: replica-set member NAMES are often legacy aliases that do not match the
+# inventory, so a name allow-list both rejects the real cluster and is a weak discriminator between
+# two sets that share a replica-set name. tasks/preflight-common.yml resolves every member name to
+# an IPv4 address and compares the resolved IP SET instead. (A stale `allowed_member_names` list
+# used to live here; it was removed rather than wired up, because nothing read it and it named
+# members that do not exist.)
 allowed_member_ips:
   - 10.0.0.11
   - 10.0.0.12
   - 10.0.0.13
-allowed_member_names:
-  - mongo1
-  - mongo2
-  - mongo3
 
 # The look-alike second set. Never a target, never a member of this set.
 forbidden_member_ips:
@@ -108,7 +110,7 @@ resync_wait_retries: 960      # 960 × 15 s = 4 h
 resync_wait_delay: 15
 
 # ── FCBIS tuning — written on legs 2 and 3 ONLY ─────────────────────────────────
-# Every name below was confirmed REGISTERED in /usr/bin/mongod v8.0.29-13 (10.0.0.21,
+# Every name below was confirmed REGISTERED in /usr/bin/mongod v8.0.29-13 (reference cluster,
 # 2026-11-20) by inspecting the binary. That check matters because an unregistered setParameter
 # makes mongod REFUSE TO START — and in a leg that happens after the dbPath has been wiped.
 #
@@ -117,7 +119,25 @@ resync_wait_delay: 15
 # during the copy. With the default 300 s / 3 cycles the leg aborts and the window is lost.
 fcbis_max_lag_sec: 1800                  # default 300
 fcbis_max_cycles_without_progress: 10    # default 3
-fcbis_source_read_pref: secondary
+
+# Which members may donate the files for an FCBIS leg.
+#   secondaryPreferred — chosen deliberately (2026-11-24), not by default:
+#   * `secondary` excludes the PRIMARY in the first selection pass. On leg 1 (mongo1 wipe) there is
+#     exactly ONE secondary in the set, so if that member is momentarily ineligible — most likely
+#     lag beyond maxSyncSourceLagSecs (default 30 s) while it donates ~0.8 TB — there is no
+#     candidate at all. mongod logs an error, waits 1 s, restarts selection, and can exit after 10
+#     attempts. That happens with a wiped dbPath: the node is then DOWN WITH NO DATA, in a change
+#     that has no backup.
+#   * `secondaryPreferred` runs the same first pass but the relaxed second pass exists, so the worst
+#     case degrades to "the primary donates the copy" — slower, extra read load on the writable
+#     node — instead of an outage.
+#   * `primaryPreferred` (the engine default for voting members) would never use a secondary and
+#     puts every copy on the primary, which is the load this plan exists to avoid.
+# Upstream: initialSyncSourceReadPreference is a MongoDB server parameter; it is NOT in the Percona
+# 8.0.12-4 manual, whose FCBIS table lists only five parameters (checked 2026-11-20, pages 207-208).
+# It takes precedence over rs.conf().settings.chainingAllowed during initial sync, so chaining does
+# not need to be checked. See README §5B.
+fcbis_source_read_pref: secondaryPreferred
 
 # The exact strings the 8.0.29 binary logs, taken from the binary itself (strings /usr/bin/mongod).
 # NOTE THE HYPHEN in the first one: an earlier draft of tasks/encrypt-leg.yml grepped
@@ -167,7 +187,39 @@ fingerprint_js: |
     });
   print(JSON.stringify({total:total,perDb:out}));
 
-# ── Audit / retention (matches the reference cluster policy) ──────────────────────────────────
+# ── Audit log (W3) — configured by playbooks/05a-audit-log.yml ──────────────────
+# Why this is code and not a checklist item: the previous estate did it by hand, and a manual step
+# performed at 02:00 is not a control. It also costs no extra restart — mongod reads `auditLog`
+# only at startup, and 05-tls already restarts all three members in W3, so the config written by
+# 05a is activated by that rollout. 05-tls refuses to roll if 05a did not run.
 audit_enabled: true
-log_rotate_trigger_bytes: 1073741824     # 1 GiB
-log_retention_days: 7
+audit_format: JSON
+# THE FILTER IS THE VOLUME LEVER. Empty string = full fidelity: every authorization check is
+# logged, which at this cluster's write rate (~340/s) is multi-GB/day on the system volume.
+# The default records the security-relevant event types only: authentication, user/role changes,
+# DDL, index changes, shutdown, replica-set reconfig, log rotation. Set `audit_filter: ""` to match
+# a full-fidelity policy — and raise the disk gate in 00-preflight if you do.
+audit_filter: >-
+  { atype: { $in: [ "authenticate", "createUser", "dropUser", "updateUser",
+  "dropAllUsersFromDatabase", "grantRolesToUser", "revokeRolesFromUser", "createRole",
+  "updateRole", "dropRole", "dropAllRolesFromDatabase", "grantPrivilegesToRole",
+  "revokePrivilegesFromRole", "createCollection", "dropCollection", "createDatabase",
+  "dropDatabase", "createIndex", "dropIndex", "renameCollection", "collMod", "shutdown",
+  "replSetReconfig", "auditLogRotate" ] } }
+log_rotate_trigger_bytes: 1073741824     # 1 GiB — rotate when audit.log OR mongod.log exceeds it
+log_retention_days: 7                    # rotated files older than this are deleted
+audit_max_total_gb: 20                   # hard cap on rotated audit volume (oldest deleted first)
+audit_rotate_check_minutes: 10           # cron cadence for the size check + purge
+audit_rotate_script: /usr/local/sbin/mongo-audit-logrotate
+audit_rotate_pw_file: /root/.mongo-audit-rotator.pw
+audit_cron_file: /etc/cron.d/mongo-audit-logrotate
+audit_rotate_selftest: true              # 06-verify forces one rotation to prove it really rotates
+
+# ── Network exposure — DECIDED 2026-11-24, deliberately NOT managed here ────────
+# bindIp stays 0.0.0.0. No playbook merges net.bindIp: it is recorded in the baseline/verify
+# reports and otherwise left alone. Rationale and compensating controls: README §11, accepted
+# risk R3. Tightening it is a separate change that needs the real app-subnet list, and it must not
+# land in the same window as the version/encryption/TLS work.
+bind_ip: "0.0.0.0"
+bind_ip_managed: false
+

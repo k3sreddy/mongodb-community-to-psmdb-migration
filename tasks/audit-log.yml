@@ -1,0 +1,214 @@
+---
+# Audit log: write the config, prove the config, install size-triggered rotation + retention.
+# Included by playbooks/05a-audit-log.yml.
+#
+# WRITES CONFIG ONLY — mongod reads `auditLog` at startup, so nothing here is active until the next
+# restart. That is by design: 05-tls already restarts all three members in W3, so the audit log
+# costs no additional restart. 05-tls refuses to roll unless this file's config is already in place.
+#
+# Idempotent: re-running rewrites the same block, re-ensures the role/user, and reinstalls the
+# script and cron entry unchanged.
+
+- name: "Audit | log directory must be writable by mongod"
+  ansible.builtin.file:
+    path: "{{ audit_log | dirname }}"
+    state: directory
+    owner: mongod
+    group: mongod
+    mode: "0750"
+
+- name: "Audit | merge the auditLog block (config only, no restart)"
+  ansible.builtin.include_tasks: ./merge-mongod-conf.yml
+  vars:
+    conf_label: "audit"
+    # The filter key is omitted entirely when audit_filter is empty: an empty string is not a valid
+    # audit filter, and omitting the key is what "full fidelity" means.
+    _audit_block: >-
+      {{ {'destination': 'file', 'format': audit_format, 'path': audit_log}
+         | combine({'filter': audit_filter | trim}
+                   if (audit_filter | default('') | trim | length > 0) else {}) }}
+    conf_merge: "{{ {'auditLog': _audit_block} }}"
+
+# A config grep proves the file was written. It does not prove mongod will accept it — that is what
+# 06-verify's getCmdLineOpts gate is for, and an invalid auditLog block makes mongod REFUSE TO
+# START, which in W3 means the first restarted member does not come back.
+- name: "Audit | config gate (exactly one block, intended values)"
+  ansible.builtin.shell: |
+    set -o pipefail
+    test "$(grep -c '^auditLog:' {{ conf_file }})" = "1"
+    grep -q 'destination: file' {{ conf_file }}
+    grep -q 'format: {{ audit_format }}' {{ conf_file }}
+    grep -q 'path: {{ audit_log }}' {{ conf_file }}
+  args:
+    executable: /bin/bash
+  changed_when: false
+  check_mode: false
+
+# ── Least-privilege rotation identity ────────────────────────────────────────────────────────────
+# One custom role, one privilege. Custom rather than a built-in name because the built-in role set
+# differs between builds and a wrong name fails at 02:00, not here.
+- name: "Audit | ensure the rotator role and user exist (idempotent)"
+  ansible.builtin.command:
+    argv: "{{ mongo_rs_argv + ['--eval', _rotator_js] }}"
+  vars:
+    _rotator_js: |
+      const adm = db.getSiblingDB('admin');
+      const U = {{ audit_rotator_user | to_json }};
+      const P = {{ audit_rotator_password | to_json }};
+      const ROLE = 'auditRotator';
+      let role = 'exists';
+      if (!adm.getRole(ROLE)) {
+        adm.createRole({ role: ROLE,
+                         privileges: [{ resource: { cluster: true }, actions: ['logRotate'] }],
+                         roles: [] });
+        role = 'created';
+      }
+      let user = 'exists';
+      if (!adm.getUser(U)) {
+        adm.createUser({ user: U, pwd: P, roles: [{ role: ROLE, db: 'admin' }] });
+        user = 'created';
+      }
+      print(JSON.stringify({ role: role, user: user,
+                             roles: adm.getUser(U).roles.map(r => r.role) }));
+  register: rotator_provision
+  changed_when: "'\"created\"' in rotator_provision.stdout"
+  check_mode: false
+  no_log: true
+  # Needs a PRIMARY to create a user; mongo_rs_argv discovers it. Once per run is enough — the
+  # user lives in the replicated admin database.
+  run_once: true
+
+- name: "Audit | the rotator identity must be exactly as privileged as intended"
+  ansible.builtin.assert:
+    that:
+      - (rotator_provision.stdout | from_json).roles | length == 1
+      - (rotator_provision.stdout | from_json).roles[0] == 'auditRotator'
+    fail_msg: >-
+      {{ audit_rotator_user }} has roles {{ (rotator_provision.stdout | from_json).roles | default([]) }},
+      expected exactly ['auditRotator']. A rotation cron must never hold more than logRotate —
+      fix the user in admin before continuing.
+    quiet: true
+  run_once: true
+
+# ── Rotation + retention ────────────────────────────────────────────────────────────────────────
+# Not logrotate: PSMDB has no `rotateAuditLog` and rejects `logRotate: "auditLog"`. `logRotate: 1`
+# (reopen) is what this build accepts and it rotates BOTH the system log and the audit log — which
+# the script then proves, because "the command returned ok" is not evidence that the audit file
+# actually rotated.
+- name: "Audit | rotation + retention script"
+  ansible.builtin.copy:
+    dest: "{{ audit_rotate_script }}"
+    owner: root
+    group: root
+    mode: "0750"
+    content: |
+      #!/usr/bin/env bash
+      # Rotate the MongoDB audit log and system log BY SIZE, then enforce retention.
+      # Installed by playbooks/05a-audit-log.yml — do not hand-edit; change group_vars instead.
+      #
+      # Rotation mechanism: `logRotate: 1` (reopen), authenticated as the least-privilege
+      # {{ audit_rotator_user }} user (privilege: logRotate only). PSMDB does not implement
+      # `rotateAuditLog`, and `logRotate: "auditLog"` is rejected on this build.
+      #
+      # The command returning ok is NOT proof the audit file rotated: it may have rotated only the
+      # system log. The script therefore counts audit.log.<stamp> files before and after and exits
+      # non-zero if nothing new appeared — so a silently useless cron is loud instead of invisible.
+      set -uo pipefail
+
+      PORT={{ mongo_port }}
+      AUDIT={{ audit_log }}
+      SYSLOG={{ system_log }}
+      TRIGGER={{ log_rotate_trigger_bytes }}
+      RETENTION_DAYS={{ log_retention_days }}
+      MAX_TOTAL_GB={{ audit_max_total_gb }}
+      ROT_USER={{ audit_rotator_user }}
+      PW_FILE={{ audit_rotate_pw_file }}
+      FORCE=${FORCE:-0}
+      DIR="$(dirname "$AUDIT")"
+
+      log() { logger -t mongo-audit-rotate -- "$*" 2>/dev/null; echo "$*"; }
+      size_of() { if [ -f "$1" ]; then stat -c %s "$1"; else echo 0; fi; }
+      count_rotated() { find "$DIR" -maxdepth 1 -type f -name 'audit.log.*' 2>/dev/null | wc -l; }
+
+      # The cron may fire before the restart that activates auditLog. That is not an error.
+      if [ ! -f "$AUDIT" ]; then
+        log "inactive: $AUDIT does not exist yet (mongod has not restarted since the config change)"
+        exit 0
+      fi
+      if [ ! -r "$PW_FILE" ]; then
+        log "FAIL: $PW_FILE (0600 root) is missing — cannot authenticate as $ROT_USER"
+        exit 1
+      fi
+
+      A_SIZE=$(size_of "$AUDIT"); S_SIZE=$(size_of "$SYSLOG")
+      if [ "$FORCE" != "1" ] && [ "$A_SIZE" -lt "$TRIGGER" ] && [ "$S_SIZE" -lt "$TRIGGER" ]; then
+        exit 0
+      fi
+
+      BEFORE=$(count_rotated)
+      OUT=$(mongosh --quiet --norc --host 127.0.0.1 --port "$PORT" \
+              --username "$ROT_USER" --password "$(cat "$PW_FILE")" \
+              --authenticationDatabase admin \
+              --eval 'const r = db.adminCommand({ logRotate: 1 });
+                      if (!r.ok) { print("ROTATE-FAILED " + EJSON.stringify(r)); quit(2); }
+                      print("ROTATE-OK");' 2>&1)
+      RC=$?
+      AFTER=$(count_rotated)
+      log "audit=${A_SIZE}B syslog=${S_SIZE}B rc=$RC rotated=${BEFORE}->${AFTER} :: $(printf '%s' "$OUT" | tr '\n' ' ' | tail -c 200)"
+
+      if [ "$RC" -ne 0 ]; then log "FAIL: logRotate exited $RC"; exit 2; fi
+      if [ "$AFTER" -le "$BEFORE" ]; then
+        log "FAIL: logRotate returned ok but no audit.log.<stamp> appeared — audit rotation is NOT working"
+        exit 3
+      fi
+
+      # Age-based retention.
+      find "$DIR" -maxdepth 1 -type f \( -name 'audit.log.*' -o -name 'mongod.log.*' \) \
+           -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
+
+      # Hard volume cap. /var/log shares the system volume, and unbounded audit growth is how a
+      # database node loses its root filesystem. Oldest rotations go first.
+      CAP=$(( MAX_TOTAL_GB * 1073741824 ))
+      while : ; do
+        TOTAL=$(find "$DIR" -maxdepth 1 -type f -name 'audit.log.*' -printf '%s\n' 2>/dev/null \
+                | awk '{s+=$1} END {print s+0}')
+        [ "${TOTAL:-0}" -le "$CAP" ] && break
+        OLDEST=$(find "$DIR" -maxdepth 1 -type f -name 'audit.log.*' -printf '%T@ %p\n' 2>/dev/null \
+                 | sort -n | head -1 | cut -d' ' -f2-)
+        [ -n "${OLDEST:-}" ] || break
+        log "cap: deleting $OLDEST (rotated audit total ${TOTAL}B > ${CAP}B)"
+        rm -f "$OLDEST"
+      done
+      exit 0
+
+- name: "Audit | the rotation script must be syntactically valid before it is ever scheduled"
+  ansible.builtin.command:
+    argv: [/usr/bin/bash, -n, "{{ audit_rotate_script }}"]
+  changed_when: false
+  check_mode: false
+
+- name: "Audit | least-privilege credential for the cron (600 root, never in argv of an interactive shell)"
+  ansible.builtin.copy:
+    dest: "{{ audit_rotate_pw_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+    content: "{{ audit_rotator_password }}"
+  no_log: true
+
+# Every 10 minutes: is either log over the trigger, and has anything aged out? Both are cheap.
+# Its first run inside W3 will rotate the freshly-created audit.log — the rotate path is proven by
+# the size counter, not by the exit code of the command it wraps.
+- name: "Audit | install the size-check + retention cron"
+  ansible.builtin.copy:
+    dest: "{{ audit_cron_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by playbooks/05a-audit-log.yml — do not hand-edit.
+      # Rotation by size ({{ log_rotate_trigger_bytes }} bytes) + retention ({{ log_retention_days }} days)
+      # for {{ audit_log }} and {{ system_log }}.
+      SHELL=/bin/bash
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      */{{ audit_rotate_check_minutes }} * * * * root {{ audit_rotate_script }} >/dev/null 2>&1

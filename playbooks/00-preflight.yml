@@ -159,6 +159,10 @@
         state: directory
         mode: "0700"
 
+    # The record includes bindIp and the auditLog block, recorded but never asserted: this change
+    # does not manage bindIp (README §11, risk R3), and auditLog is only present if 05a already ran.
+    # The baseline is the one place the PRE-change exposure is written down, so the post-change
+    # report can state both what changed and what deliberately did not.
     - name: "00 | collect per-host baseline records"
       ansible.builtin.set_fact:
         baseline_hosts: >-
@@ -170,6 +174,8 @@
             'psmdb': hostvars[item].mongo_build.psmdbVersion | default('none (community build)'),
             'fcv': hostvars[item].mongo_fcv,
             'config_md5': hostvars[item].conf_md5.stdout_lines | join(' | '),
+            'bind_ip': hostvars[item].conf_running.net.bindIp | default('unset'),
+            'audit_log': hostvars[item].conf_running.auditLog | default(none),
             'disk_free_bytes': hostvars[item].data_avail_bytes | int,
             'nfs_mount': hostvars[item].nfs_mount.stdout | trim,
             'packages': (hostvars[item].rpm_all.stdout_lines | select('search', 'mongo') | list)

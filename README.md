@@ -24,7 +24,7 @@ with the checks that make each one loud instead of silent.
 |---|---|---|---|
 | **1. Upgrade** | `00b-bootstrap`, `02-upgrade` | Community 5.0 → PSMDB 6.0 → 7.0 → 8.0, **rolling, secondaries first, primary last**. FCV raised only after every member reports the new binary. | none (a `stepDown`, i.e. one election per hop) |
 | **2. Encryption** | `03-encryption-keys`, `04-encrypt-nodes` | Each node in turn: wipe its `dbPath`, resync from a healthy peer with **AES256-GCM at rest** enabled, verify fingerprint completeness before touching the next node | none (never more than one member down) |
-| **3. TLS** | `05-tls` | Certificates distributed, `net.tls.mode: preferTLS`, serial restarts. Ends with **TLS and plaintext both accepted** — no application change required | a few minutes of write stall (see W3 warning) |
+| **3. Security baseline** | `05a-audit-log`, `05-tls` | Audit log config (JSON, least-privilege rotator, 1 GiB rotation, 7-day retention), then certificates + `net.tls.mode: preferTLS` with serial restarts. Ends with **TLS and plaintext both accepted** — no application change required. Order is enforced: `05a` writes config, `05-tls`'s single restart activates it | a few minutes of write stall (see W3 warning) |
 | **4. Verify** | `00-preflight`, `06-verify` | Read-only baseline + post-change verification: versions, FCV, encryption, TLS, replication lag, per-database document fingerprints | none |
 
 ## The four things that will bite you
@@ -179,8 +179,8 @@ taking the cluster down and without a logical backup:
 | FCV | `5.0` | `8.0` |
 | At-rest encryption | **none** | AES256-GCM, shared key, DR copy off-box |
 | TLS | **none** | **enabled, `preferTLS`** — TLS accepted **and non-TLS accepted** (deliberate end state, no app change required) |
-| Audit log | none | JSON audit + 1 GiB rotation + 7-day retention |
-| bindIp | `0.0.0.0` | member IPs + `127.0.0.1` |
+| Audit log | none | JSON audit + 1 GiB size-triggered rotation + 7-day/20 GiB retention — **automated** (`05a-audit-log.yml`) and asserted by `06-verify.yml` |
+| bindIp | `0.0.0.0` | **unchanged — stays `0.0.0.0`** (decision 2026-11-24; accepted risk R3, §11). Recorded in every report, never managed by a play |
 | Backup | none, and **none taken** (decision recorded in `EXECUTION-PROTOCOL.md` §2A) | unchanged; compensating controls replace it |
 
 **In scope:** members `mongo1` (.11), `mongo2` (.12, PRIMARY), `mongo3` (.13); `/DATA/mongo` ~0.7 TB;
@@ -307,7 +307,29 @@ majority and turns this into a real outage.
 
 `requireTLS` is **not** part of this change — it is unreachable without `-e confirm_require_tls=YES`, and it
 would break every application that has not yet moved to `tls=true`. See §11 for the risk this accepts.
-Audit log enable + 1 GiB rotation cron + 7-day retention. `bindIp` restriction + firewall.
+
+**Order inside this window: `05a-audit-log.yml` → `05-tls.yml` → `06-verify.yml`.** mongod reads its
+`auditLog` block **only at startup**, and `05-tls` performs this window's only restart — so the audit log
+costs no extra rollout, and `05-tls` refuses to roll if `05a` has not already written the block (ordering
+gate). Running them the other way round silently defers the audit log to "some later restart", which in
+practice means never.
+
+`05a-audit-log.yml` (config only — nothing is active until the restart):
+- writes `auditLog` (JSON file destination, security-relevant event filter — the filter is the volume lever;
+  see `audit_filter` in the group vars)
+- creates the least-privilege `audit-rotator` user (privilege: `logRotate` **only**), because a cron that
+  fires every 10 minutes must not hold admin
+- installs size-triggered rotation (1 GiB, checked every 10 min) with 7-day age retention and a 20 GiB hard
+  cap — via `logRotate: 1` (reopen), since PSMDB has no `rotateAuditLog`
+
+`06-verify.yml` then answers three separate questions, because each fails differently: did the **running
+process** parse the block (`getCmdLineOpts`), does the file contain valid JSON, and does a **forced rotation
+actually produce** a new `audit.log.<stamp>` (the command returning `ok` is not evidence).
+
+`bindIp` is **not** changed: it stays `0.0.0.0` by decision. No play merges `net.bindIp`; the baseline and
+verify reports record the value so the exposure is documented rather than assumed. Rationale and
+compensating controls: §11 R3.
+
 `06-verify.yml` — final fingerprint equality, smoke test, per-node build/FCV/encryption report.
 
 ---
@@ -372,7 +394,8 @@ Audit log enable + 1 GiB rotation cron + 7-day retention. `bindIp` restriction +
 - [ ] Fingerprint identical on all 3 and equal to baseline (± live app writes — explain every delta)
 - [ ] Plaintext-leak scan: unique token not found in dbPath (`grep -a` → 0)
 - [ ] `mongo2` PRIMARY (priority 2), lag ≤ 2 s, smoke write→replicate→read→delete PASS
-- [ ] Audit log capturing; rotation + retention active; `bindIp` restricted
+- [ ] Audit log proven on all 3: running process parsed the block, file holds valid JSON, **a forced rotation produced a new `audit.log.<stamp>`**, cron + script installed (`06-verify.yml` asserts all four)
+- [ ] `bindIp` recorded in the report as `0.0.0.0` — **unchanged by decision** (R3); no play was allowed to touch it
 - [ ] Old RPMs retained ~1 week, then cleaned; report filed; change closed
 
 ---
@@ -466,7 +489,7 @@ logged at default verbosity.
 |---|---|---|---|
 | W1 | 3–4 h | Preflight + FBIS re-rehearsal + Phase 1 (3 hops) | 3–4 failovers, 10–30 s each, transparent with `retryWrites` |
 | W2 | 3–4 h | Phase 2 encryption (1 logical + 2 FCBIS) | 1 failover (~10–30 s) |
-| W3 | ~1 h | TLS staging, audit log, bindIp, final verify | none (rolling restart in one script) |
+| W3 | ~1 h | `05a-audit-log` → `05-tls` (TLS staging), final verify — `bindIp` **not** changed | none (one serial rolling restart, which also activates the audit log) |
 
 Phase 2 must not start less than 24 h after Phase 1 close (burn-in), and must not overlap any work on
 the reference cluster — the two sets share a name and app teams confuse them.
@@ -496,17 +519,19 @@ ansible-prod-live-mongo/
 │   │                                #   (15 min for a restart, 4 h for a wipe+resync)
 │   ├── tls-activate-one.yml         # one member: optional stepDown → restart → wait (G9, serial)
 │   ├── merge-mongod-conf.yml        # YAML-aware config merge, backup + integrity gate
+│   ├── audit-log.yml                # auditLog block + least-priv audit-rotator + rotation/retention cron
 │   └── encrypt-leg.yml              # one wipe+resync leg with the config gate (G10/G11, G-D)
 ├── playbooks/
 │   ├── 00-preflight.yml             # read-only baseline → artifacts/
+│   ├── 00b-bootstrap.yml            # prerequisites only: percona-release + mongosh (no config, no data)
 │   ├── 01-backup.yml                # OPTIONAL — not imported by site.yml, no backup in this change
 │   ├── 02-upgrade.yml               # hops 6.0/7.0/8.0, rolling, stepDown, FCV
 │   ├── 03-encryption-keys.yml       # shared key + DR copies (no restarts)
 │   ├── 04-encrypt-nodes.yml         # logical → FCBIS → FCBIS, serial
+│   ├── 05a-audit-log.yml            # audit config + rotation cron (NO restart — activated by 05)
 │   ├── 05-tls.yml                   # preferTLS enable, serial restarts (G9), both transports verified
-│   ├── 06-verify.yml                # fingerprint compare + smoke + report
+│   ├── 06-verify.yml                # fingerprint compare + smoke + audit/rotation proof + report
 │   └── site.yml                     # ordered entry point with tag gates
-│   ├── 00b-bootstrap.yml            # prerequisites only: percona-release + mongosh (no config, no data)
 ├── scripts/
 │   ├── issue-certs.sh               # PKI for this cluster (control host only, never on a DB node)
 │   └── audit.sh → audit.py          # static audit: templates, vars, module args, fail-open gates.
@@ -529,7 +554,10 @@ ansible-playbook playbooks/02-upgrade.yml   -e change_ticket=CHG-xxxx -e confirm
 ansible-playbook playbooks/03-encryption-keys.yml -e change_ticket=CHG-xxxx -e confirm_window=YES
 ansible-playbook playbooks/04-encrypt-nodes.yml   -e change_ticket=CHG-xxxx -e confirm_window=YES -e confirm_wipe=WIPE
 ansible-playbook playbooks/06-verify.yml          -e change_ticket=CHG-xxxx
+#   Window 3 — ORDER MATTERS: 05a writes the audit config, 05's restart activates it, 06 proves it
+ansible-playbook playbooks/05a-audit-log.yml      -e change_ticket=CHG-xxxx -e confirm_window=YES
 ansible-playbook playbooks/05-tls.yml             -e change_ticket=CHG-xxxx -e confirm_window=YES
+ansible-playbook playbooks/06-verify.yml          -e change_ticket=CHG-xxxx
 ```
 
 `00` and `06` are read-only in effect and need no confirmation. `--check` is supported on `00`, `05`
@@ -666,6 +694,29 @@ resyncing one node from the two survivors — there is no archive to fall back t
 | A Phase-2 leg declared failed mid-sync because the wait budget was too short | — | M | `wait_retries` is a variable: 15 min for restarts, 4 h (`resync_wait_retries: 960`) for wipe+resync legs |
 | Key loss (DR) | L | Critical | Identical key on 3 nodes + NFS + off-box; sha256 recorded in preflight artifacts |
 | Operator fatigue across 3 windows | M | M | Phase 2 blocked < 24 h after Phase 1; one cluster per night |
+
+### Accepted risks (signed, not mitigated away)
+
+**R1 — No backup is taken.** Rollback is peer resync only; two members lost in the same change is
+unrecoverable. Compensating: serial legs, survivor-health gates before every wipe, per-leg fingerprint
+completeness check against the baseline, lab rehearsal, RPM/config rollback for Phase 1.
+
+**R2 — TLS is `preferTLS`, not `requireTLS`.** Non-TLS client connections remain accepted, so the TLS
+change does not actually prevent a plaintext connection. Compensating: `requireTLS` is unreachable from
+the playbooks without `-e confirm_require_tls=YES`, the upgrade path to it is one config key change once
+every app has moved to `tls=true`, and the end state is verified by `06-verify.yml` (both transports
+proven available on every member).
+
+**R3 — `bindIp` stays `0.0.0.0`.** MongoDB listens on every interface, so exposure is limited only by the
+network path and by authentication. Reasons for not changing it in the same window: the real client subnet
+list is usually not documented, and a wrong `bindIp` is a *silent* outage that only appears when the app
+reconnects — which would land on top of a version change, a wipe+resync and a TLS rollout. Compensating
+controls that are already true: `security.authorization: enabled` with SCRAM (every connection must
+authenticate), per-role least privilege, TLS available (`preferTLS`), the value recorded in
+`artifacts/baseline-*.json` and `artifacts/verify-*.json` so the exposure is documented rather than
+assumed, and no play merges `net.bindIp` (`bind_ip_managed: false` in the group vars) so nothing can change
+it by accident. **Follow-up (separate change, own window): bind to the member IPs + `127.0.0.1`, then add a
+host firewall.** Do not fold it into this one.
 
 ---
 
@@ -961,6 +1012,48 @@ remains cannot be tested without changing the cluster:
 | `change_ticket` required by every applying play | the gates become auditable in the scrollback, and an ad-hoc run is impossible |
 | Plaintext-leak scan is **sampled** (10 newest data files) | a full `grep` over 0.8 TB is hours of IO on a production node. It is also **indicative only** — WiredTiger block compression can hide a plaintext token, so `serverStatus().encryptionAtRest` remains the authoritative check |
 
+**Seventh audit — 2026-11-24, "documented but not implemented" sweep.** This pass did not re-read the
+prose: it compared the README's promises against the code, then ran every declared variable against every
+reference to find the ones nothing consumes. Six defects, one of them a **run-stopper that would have
+fired on the first hop**:
+
+1. **The FCV is a document, not a string — every FCV gate was dead.** `getParameter` answers with
+   `{version: "5.0"}`, confirmed on a live 5.0.8 cluster rather than inferred. Rendering that with
+   `| string` gives `{'version': '5.0'}`, which never matches `^5\.0`. So the "never skip a hop" ratchet
+   and the post-hop assert would have aborted the very first hop — safely, before anything changed, but
+   the window would have died with no obvious cause. `tasks/preflight-common.yml` now normalises to
+   `mongo_fcv` (plain version) and keeps `mongo_fcv_raw` for inspection; the shape is exercised against
+   nine synthetic cases (doc/string shape, mid-hop, hop-done, wrong rung, skipped rung, off-ladder, FCV
+   ahead of binary, end state).
+2. **Nothing checked the cluster was on 5.0 before the first hop.** `expected_start_major` was declared and
+   never read. It now feeds guardrail **G0**: binary major and FCV major must both be on the planned ladder
+   (5.0 → 6.0 → 7.0 → 8.0), and the FCV may never be ahead of the binary. Written as membership, not
+   equality, so an interrupted window resumes instead of refusing.
+3. **The audit-log scope was configuration with no consumer.** Four variables and one vault secret were
+   declared and read by nothing: no task wrote `auditLog`, nothing created the rotator identity, no cron
+   existed, and `06-verify.yml` asserted nothing — while four places in the docs claimed it was covered.
+   Now `playbooks/05a-audit-log.yml` + `tasks/audit-log.yml`, with three independent verify assertions
+   (running-process config, JSON shape, **forced rotation actually produces a new file**).
+4. **`05a` could be skipped and nobody would notice.** mongod reads `auditLog` only at startup, so a skipped
+   `05a` silently defers the audit log to "the next restart", which in practice is never. `05-tls.yml` now
+   refuses to roll unless the block is already present (`default(true)` on the gate, so an *undefined*
+   `audit_enabled` refuses rather than passes).
+5. **A resume could strand the change.** `node-upgrade.yml` required binary and FCV to be exactly at
+   `previous_major`. If a window died after swapping one member's packages, re-running the hop — the safe
+   recovery — was refused on that member, and the only remaining route was the unsafe one. Both now accept
+   `previous_major` **or** the hop, and mongod is not stopped again on a member already on the target build.
+6. **A wiped node could be left with no eligible donor.** `fcbis_source_read_pref: secondary` excludes the
+   primary from its first selection pass; on leg 1 there is exactly one secondary, so a moment of
+   ineligibility (lag > `maxSyncSourceLagSecs`, default 30 s) leaves no candidate and mongod can exit after
+   10 attempts — with a wiped dbPath and no backup. Now `secondaryPreferred`, which degrades to the primary
+   instead of failing. Each leg also records **which member actually donated the copy**.
+
+Two smaller cleanups: a stale `allowed_member_names` list (naming members that do not exist) was removed
+rather than wired up, and the baseline/verify reports now record `bindIp` and the `auditLog` block so the
+exposure is documented without being managed. `./scripts/audit.sh` is clean, and it caught two defects
+introduced *during* this pass — a `#` comment inside a `>-` block, and a `not (x | default(false))`
+fail-open — which is the script doing its job.
+
 ---
 
 ## 13. Decisions you must make before you run this
@@ -973,13 +1066,20 @@ These are the choices that are **not** technical defaults. Each one changes the 
 2. **`requireTLS` or `preferTLS`?** This plan ends at **`preferTLS`** deliberately: TLS and plaintext are
    both accepted, so no application change is needed on day one. `requireTLS` is a *separate* change —
    every client needs `tls=true` and the CA mounted, and it must be flipped only after that is true.
-3. **`bindIp`.** `0.0.0.0` is the default that ships. Tighten it to the member IPs plus `127.0.0.1` once
-   you know the application subnets. Do not guess.
+3. **`bindIp`.** `0.0.0.0` is the default that ships, and **this repo deliberately leaves it there** (accepted
+   risk R3, §11): the playbooks only *record* it, they never manage it (`bind_ip_managed: false`). Tighten it
+   to the member IPs plus `127.0.0.1` once you know the application subnets — as its own change, with its own
+   window, and after a failed reconnect has been costed. Do not guess, and do not fold it into the migration
+   window: a wrong `bindIp` only shows up when an app reconnects.
 4. **Key management.** A local 32-byte keyfile (copied off-box for DR) is what this repo automates. That
    key is now as critical as the data: KMIP/Vault is the grown-up answer, a documented local key is the
    pragmatic one. Decide, and write down where the DR copy lives.
 5. **Audit log retention and shipping.** JSON audit + 1 GiB rotation + 7 days is a starting point, not a
-   policy. Where do the audit logs actually go?
+   policy — and `05a-audit-log.yml` now implements it (config, least-privilege `logRotate` user, size-triggered
+   rotation, age retention, volume cap). The knob that matters most is `audit_filter`: an **empty** filter
+   logs every authorization check, which at a few hundred writes/s is multi-GB per day on the system volume.
+   The shipped default records security-relevant event types only. Decide your fidelity *and* where the
+   rotated files actually go (a cron on the same box is rotation, not shipping).
 6. **Certificate renewal.** Ours: CA 10 years, node certificates 2 years, **nothing renews them**. Put the
    expiry on a calendar or in monitoring. A silently expired member certificate stops replication under
    `preferTLS` exactly like a config error would — and it will happen at 03:00 on a Sunday.

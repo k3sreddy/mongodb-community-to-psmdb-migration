@@ -16,6 +16,14 @@ mongo_auth_db: admin
 # '__UNSET__' means the vault file was never created — preflight-common.yml refuses to run.
 mongo_admin_password: "{{ vault_mongo_admin_password | default('__UNSET__') }}"
 
+# Least-privilege identity that the audit-log rotation cron authenticates as. It holds exactly one
+# privilege — `logRotate` on the cluster — so the copy that lives on every node (600, root) cannot
+# read or write data, change users, or touch the replica set. It is deliberately NOT the admin
+# credential: a cron that runs every 10 minutes should never hold admin.
+# Created/owned by playbooks/05a-audit-log.yml, verified by 06-verify.yml.
+audit_rotator_user: audit-rotator
+audit_rotator_password: "{{ vault_audit_rotator_password | default('__UNSET__') }}"
+
 # Which mongo shell to drive. mongosh is REQUIRED for the migration (the legacy `mongo`
 # binary disappears from the filesystem when the community 5.0 packages are removed), but the
 # read-only baseline in 00-preflight must be able to run on a node that still only has `mongo`.
@@ -24,8 +32,9 @@ mongo_admin_password: "{{ vault_mongo_admin_password | default('__UNSET__') }}"
 mongo_shell: mongosh
 
 # Per-node local shell argv (used for every node-scoped read/diagnostic).
-# `--norc` is legacy-shell-only: mongosh does not accept it. Passing an unknown option makes
-# the shell exit non-zero, so the flag is added conditionally rather than unconditionally.
+# `--norc` is accepted by BOTH shells (mongosh: "prevents the shell from sourcing ~/.mongoshrc.js"),
+# so it is safe here and in mongo_rs_argv below. It is added conditionally only so the argv on a
+# mongosh-only estate stays exactly what was rehearsed.
 mongo_base_argv: >-
   {{ ([mongo_shell] + (['--norc'] if mongo_shell == 'mongo' else [])
       + ['--quiet',

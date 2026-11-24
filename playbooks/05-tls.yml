@@ -107,6 +107,28 @@
           that hostname. Members would fail to authenticate each other.
         quiet: true
 
+    # Ordering gate — 05a-audit-log.yml must have run first. mongod applies `auditLog` only at
+    # startup, and this play performs the window's ONLY restart, so skipping 05a means the audit
+    # log silently does not exist until somebody restarts again — while the close-out checklist
+    # still says "audit active". Cheap to check here, impossible to notice at 04:00 otherwise.
+    - name: "05 | read the config before touching anything"
+      ansible.builtin.slurp:
+        src: "{{ conf_file }}"
+      register: pre_tls_conf
+
+    - name: "05 | audit-log config must already be in place (05a ran first)"
+      ansible.builtin.assert:
+        that:
+          # default(true): an UNDEFINED audit_enabled must refuse, not pass. A gate that opens
+          # when its input is missing is not a gate — it is a comment.
+          - not (audit_enabled | default(true) | bool)
+            or (pre_tls_conf.content | b64decode | from_yaml).auditLog is defined
+        fail_msg: >-
+          audit_enabled is true but {{ conf_file }} on {{ inventory_hostname }} carries no auditLog
+          block. Run playbooks/05a-audit-log.yml first — this play's restart is the only chance to
+          activate it, and catching up later means a second rollout. Nothing has been changed yet.
+        quiet: true
+
     - name: "05 | merge the net.tls block (config only — every member changes before any restart)"
       ansible.builtin.include_tasks: ../tasks/merge-mongod-conf.yml
       vars:

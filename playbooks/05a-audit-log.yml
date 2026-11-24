@@ -1,0 +1,66 @@
+---
+# 05a — Audit logging: config + least-privilege rotation + retention. NO RESTART.
+#
+#   ansible-playbook playbooks/05a-audit-log.yml -e change_ticket=CHG-xxxx -e confirm_window=YES
+#
+# RUN THIS BEFORE 05-tls.yml, in the same window. mongod reads `auditLog` only at startup, and
+# 05-tls performs the only planned restart in this window — so the audit log costs no extra
+# rollout. 05-tls refuses to roll unless this play's config is already in place (ordering gate).
+#
+# Why it exists as code at all: the previous cluster got audit logging by hand (mongod.conf edit,
+# logrotate file, a least-privilege logRotate user, a 1 GiB size checker, a 7-day purge). That
+# worked, and it is also unreproducible at 02:00 and unverifiable afterwards. Here the same policy
+# is five idempotent tasks plus a gate in 06-verify.
+- name: "05a | audit log (config only — activated by the 05-tls restart)"
+  hosts: prod_live
+  gather_facts: false
+  # Every step below runs after the community packages are removed, and the legacy `mongo`
+  # binary belongs to them. Refuse to start unless mongosh is present (preflight-common.yml).
+  vars:
+    require_mongosh: true
+  tasks:
+    - name: "05a | window gate"
+      ansible.builtin.assert:
+        that:
+          - change_ticket is defined and change_ticket | length > 3
+          - confirm_window | default('') == 'YES'
+          - audit_enabled | default(false) | bool
+        fail_msg: >-
+          Refusing to run. Pass -e change_ticket=CHG-xxxx -e confirm_window=YES, with
+          audit_enabled: true in inventory/group_vars/prod_live/main.yml.
+        quiet: true
+
+    - name: "05a | the rotator credential must come from the vault"
+      ansible.builtin.assert:
+        that:
+          - audit_rotator_password not in ['__UNSET__', 'REPLACE_ME', '']
+        fail_msg: >-
+          vault_audit_rotator_password is unset or still the placeholder. The rotation cron
+          authenticates as {{ audit_rotator_user }}, which holds the logRotate privilege only —
+          it must exist in the vault before this runs (README §9).
+        quiet: true
+
+    - name: "05a | what this window will do"
+      ansible.builtin.debug:
+        msg:
+          - "audit log       : {{ audit_log }} ({{ audit_format }}, destination file)"
+          - "filter          : {{ 'full fidelity (every authorization check)' if (audit_filter | default('') | trim | length == 0) else 'security-relevant events only (audit_filter)' }}"
+          - "rotation        : by size > {{ (log_rotate_trigger_bytes | int / 1073741824) | round(1) }} GiB, checked every {{ audit_rotate_check_minutes }} min"
+          - "retention       : {{ log_retention_days }} days, hard cap {{ audit_max_total_gb }} GiB of rotated audit volume"
+          - "writable by     : {{ audit_rotator_user }} (privilege: logRotate only)"
+          - "NOT active yet  : mongod reads auditLog at startup — 05-tls activates it"
+      run_once: true
+
+    - name: "05a | identity, membership and health"
+      ansible.builtin.include_tasks: ../tasks/preflight-common.yml
+
+    - name: "05a | configure the audit log, rotator and retention"
+      ansible.builtin.include_tasks: ../tasks/audit-log.yml
+
+    - name: "05a | written, not yet active"
+      ansible.builtin.debug:
+        msg:
+          - "auditLog is in {{ conf_file }} on all three members and is NOT yet active."
+          - "The next restart activates it — playbooks/05-tls.yml performs that rollout in this window."
+          - "Verify with playbooks/06-verify.yml (-e change_ticket=... ): it asserts the running"
+          - "process accepted the block AND forces one rotation to prove the cron really rotates."

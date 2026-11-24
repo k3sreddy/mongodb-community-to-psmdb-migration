@@ -171,7 +171,55 @@
 - name: Preflight | record build info and FCV
   ansible.builtin.set_fact:
     mongo_build: "{{ (build_raw.stdout | from_json).build }}"
-    mongo_fcv: "{{ (build_raw.stdout | from_json).fcv }}"
+    # Kept exactly as the server returned it. The shape is NOT stable across versions: on 5.0
+    # `getParameter` answers with a bare string ("5.0"), and from 6.0 it answers with a DOCUMENT
+    # ({"version": "6.0"}). Both are preserved here so the raw answer is inspectable, and
+    # `mongo_fcv` below is always the plain version string the rest of the project compares.
+    mongo_fcv_raw: "{{ (build_raw.stdout | from_json).fcv }}"
+
+- name: Preflight | normalise the FCV to a plain version string
+  ansible.builtin.set_fact:
+    # Every FCV gate in this project compares `mongo_fcv` with a version regex. Without this
+    # normalisation those gates break silently at exactly the wrong moment: `{version: '8.0'}`
+    # rendered with `| string` is `{'version': '8.0'}`, which never matches `^8\.0` — so the hop
+    # to 8.0 would report "hop NOT complete" on a member that upgraded perfectly, after the
+    # packages were already swapped.
+    mongo_fcv: "{{ mongo_fcv_raw.version if (mongo_fcv_raw is mapping) else mongo_fcv_raw }}"
+
+# ── Known-state gate (guardrail G0) ─────────────────────────────────────────────────────────────
+# The plan is a ladder — 5.0 → 6.0 → 7.0 → 8.0, one hop at a time — and every playbook assumes the
+# cluster is ON one of those rungs. Until now nothing checked it: `expected_start_major` was
+# declared and never read, so `02-upgrade.yml -e hop=6.0` would run against a set that was still on
+# 4.4 (mongod then refuses to start on the data files, after the packages are swapped) or one that
+# was already at 8.0 (a noisy no-op).
+#
+# Deliberate choice of `in`, NOT `== expected_start_major`: this gate has to survive a resumed
+# window. If hop 6.0 completed and the change was paused, the correct state to resume from is 6.0,
+# and refusing to run would be the wrong answer. What it does refuse is the two states that
+# actually damage a cluster: an unplanned version (wrong host, stray package) and an FCV ahead of
+# the binary — an FCV can never legitimately exceed the binary that wrote it, and a member in that
+# state will not start or has already failed.
+- name: Preflight | where this member sits on the planned version ladder
+  ansible.builtin.set_fact:
+    planned_majors: "{{ ([expected_start_major] + (upgrade_hops | map(attribute='major') | list)) | unique | list }}"
+    binary_major: "{{ mongo_build.version.split('.')[:2] | join('.') }}"
+    fcv_major: "{{ mongo_fcv.split('.')[:2] | join('.') }}"
+
+- name: Preflight | build and FCV must be on the planned ladder (guardrail G0)
+  ansible.builtin.assert:
+    that:
+      - mongo_fcv | string | length > 0
+      - binary_major in planned_majors
+      - fcv_major in planned_majors
+      - (fcv_major | float) <= (binary_major | float)
+    fail_msg: >-
+      {{ inventory_hostname }}: binary {{ mongo_build.version }} (major {{ binary_major }}), FCV
+      {{ mongo_fcv }} (raw {{ mongo_fcv_raw | to_json }}). This cluster must be on one rung of
+      {{ planned_majors }} (expected start {{ expected_start_major }}, then
+      {{ upgrade_hops | map(attribute='major') | join(' → ') }}), with the FCV never ahead of the
+      binary. Nothing has been changed. Either this is the wrong host, or a hop was skipped, or an
+      FCV was set without the matching packages — resolve that before running any playbook.
+    quiet: true
 
 - name: Preflight | every member must be healthy (no degraded set is ever modified)
   ansible.builtin.assert:

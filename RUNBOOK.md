@@ -129,12 +129,28 @@ If the only failure is the positive marker, read `/tmp/initial-sync-<node>.log` 
 deciding: the node is already correct and encrypted, and re-running with `-e fcbis_evidence_override=YES` is
 the documented escape hatch.
 
-## 5. Window 3 — TLS (`preferTLS`), then restarts
+## 5. Window 3 — audit log config, then TLS (`preferTLS`), then the restarts
+
+**Order matters. Run these in exactly this order:**
 
 ```bash
+# 1) audit log: writes config + rotator + rotation cron. NO restart, nothing active yet.
+ansible-playbook playbooks/05a-audit-log.yml -e change_ticket=CHG-XXXX -e confirm_window=YES
+
+# 2) TLS config on all three + the ONE serial rolling restart — this also activates the audit log
 ansible-playbook playbooks/05-tls.yml -e change_ticket=CHG-XXXX -e confirm_window=YES
+
+# 3) proof: running-config accepted the audit block, valid JSON, forced rotation produced a new file
 ansible-playbook playbooks/06-verify.yml -e change_ticket=CHG-XXXX
 ```
+
+`05-tls` refuses to roll if `05a` did not run first (ordering gate): mongod reads `auditLog` only at startup,
+so skipping `05a` quietly defers the audit log to "the next restart", which in practice is never. `05a`
+changes no running state — if it fails, stop; nothing is half-applied.
+
+`bindIp` is **not** touched in this window. It stays `0.0.0.0` by decision (README §11, accepted risk R3) and
+is only recorded in the baseline/verify reports. Do not "fix" it here — a wrong `bindIp` is a silent outage
+that lands on top of the TLS rollout.
 
 Before this: the PKI must be on db-node-1 (`artifacts/tls/ca.crt` + `mongo1/2/3.pem`). Issue it on the **admin
 Mac** (`./scripts/issue-certs.sh`) and re-run `stage-control-node.sh` to copy — the CA **private key** must

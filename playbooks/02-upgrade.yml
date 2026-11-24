@@ -59,6 +59,32 @@
           - "hop {{ hop }} → {{ upgrade_hops | selectattr('major', 'equalto', hop) | map(attribute='package') | first }}"
       run_once: true
 
+    # ── Hop precondition ───────────────────────────────────────────────────────────────────────
+    # This hop may only start from the rung below it. Written as set membership, NOT as equality,
+    # for one specific reason: a window that is interrupted must be resumable. If the packages were
+    # swapped on one member and the run then died, the cluster legitimately sits in {6.0, 5.0, 5.0}
+    # — refusing to re-run `-e hop=6.0` there would strand the change, and "fix it by skipping
+    # ahead" is precisely the thing this guardrail exists to prevent.
+    # What it still refuses is what actually breaks a cluster: starting a hop from two rungs up
+    # (7.0 cannot read 5.0 data files, and the packages are deleted before the check would
+    # otherwise happen) or from the future.
+    - name: "02 | hop precondition — start from {{ upgrade_hops | selectattr('major', 'equalto', hop) | map(attribute='previous_major') | first }} or resume a partial {{ hop }}"
+      ansible.builtin.assert:
+        that:
+          - binary_major in [previous_major, hop]
+          - fcv_major in [previous_major, hop]
+          - (fcv_major | float) <= (binary_major | float)
+        fail_msg: >-
+          {{ inventory_hostname }}: binary {{ mongo_build.version }} ({{ binary_major }}),
+          FCV {{ mongo_fcv }} ({{ fcv_major }}). Hop {{ hop }} may only be applied to a member on
+          {{ previous_major }} (or resumed on one already part-way to {{ hop }}). Starting it from
+          any other rung either skips a version — mongod cannot read data files written two majors
+          back — or re-runs a completed hop. Nothing has been changed. Run the hops in order:
+          {{ upgrade_hops | map(attribute='major') | join(' → ') }}.
+        quiet: true
+      vars:
+        previous_major: "{{ upgrade_hops | selectattr('major', 'equalto', hop) | map(attribute='previous_major') | first }}"
+
 # ── Secondaries, strictly one at a time ────────────────────────────────────────
 - name: "02 | Hop {{ hop | default('?') }} | rolling upgrade — secondaries"
   hosts: prod_live_secondary

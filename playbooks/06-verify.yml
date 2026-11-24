@@ -12,6 +12,18 @@
     - name: "06 | identity, membership and health"
       ansible.builtin.include_tasks: ../tasks/preflight-common.yml
 
+    # Recorded, never asserted: bindIp is deliberately left at 0.0.0.0 in this change (README §11,
+    # accepted risk R3). It is captured so the change record states the actual exposure instead of
+    # leaving it to memory.
+    - name: "06 | record the listening address"
+      ansible.builtin.slurp:
+        src: "{{ conf_file }}"
+      register: verify_conf
+
+    - name: "06 | record bindIp"
+      ansible.builtin.set_fact:
+        bind_ip_observed: "{{ (verify_conf.content | b64decode | from_yaml).net.bindIp | default('unset') }}"
+
     - name: "06 | encryption status"
       ansible.builtin.command:
         argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify(db.serverStatus().encryptionAtRest)'] }}"
@@ -85,6 +97,93 @@
           - (enc.stdout | from_json).encryptionCipherMode == encryption_cipher
         fail_msg: "{{ inventory_hostname }} is not encrypted: {{ enc.stdout | default('no output') }}"
         quiet: true
+
+    # ── Audit log (W3) ──────────────────────────────────────────────────────────────────────────
+    # Three different questions, because each one has its own silent failure:
+    #   1. did the RUNNING process accept the block? A config grep proves only that a file was
+    #      written: an unknown key makes mongod refuse to start, and a block written after the
+    #      process started is simply ignored.
+    #   2. is it writing, and in JSON?
+    #   3. does rotation actually rotate the AUDIT file? `logRotate: 1` may rotate only mongod.log
+    #      and still return ok — a cron that never rotates looks exactly like one that works.
+    - name: "06 | audit log as parsed by the running process"
+      ansible.builtin.command:
+        argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', 'JSON.stringify(db.adminCommand({getCmdLineOpts:1}).parsed.auditLog || null)'] }}"
+      register: audit_opts
+      changed_when: false
+      check_mode: false
+      no_log: true
+      when: audit_enabled | default(false) | bool
+
+    - name: "06 | audit log file"
+      ansible.builtin.stat:
+        path: "{{ audit_log }}"
+      register: audit_file
+      when: audit_enabled | default(false) | bool
+
+    - name: "06 | audit records must parse as JSON with the expected shape"
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_python_interpreter }}"
+          - "-c"
+          - |
+            import json, sys
+            ok = False
+            with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
+                for line in fh.read().splitlines()[-50:]:
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    ok = ok or ("atype" in d and "ts" in d)
+            print("JSON-OK" if ok else "JSON-SHAPE-BAD")
+          - "{{ audit_log }}"
+      register: audit_json
+      changed_when: false
+      check_mode: false
+      when: audit_enabled | default(false) | bool
+
+    - name: "06 | rotation script and cron must be installed"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ audit_rotate_script }}"
+        - "{{ audit_cron_file }}"
+      register: audit_install
+      when: audit_enabled | default(false) | bool
+
+    - name: "06 | force one rotation"
+      ansible.builtin.command:
+        argv: [/usr/bin/bash, "{{ audit_rotate_script }}"]
+      environment:
+        FORCE: "1"
+      register: audit_selftest
+      changed_when: true
+      when:
+        - audit_enabled | default(false) | bool
+        - audit_rotate_selftest | default(true) | bool
+
+    - name: "06 | audit log gates"
+      ansible.builtin.assert:
+        that:
+          - (audit_opts.stdout | from_json) is not none
+          - (audit_opts.stdout | from_json).destination == 'file'
+          - (audit_opts.stdout | from_json).format == audit_format
+          - (audit_opts.stdout | from_json).path == audit_log
+          - audit_file.stat.exists
+          - audit_file.stat.size | int > 0
+          - "'JSON-OK' in audit_json.stdout"
+          - "'ROTATE-OK' in audit_selftest.stdout"
+          - audit_install.results | selectattr('stat.exists') | list | length == 2
+        fail_msg: >-
+          The audit log is not working on {{ inventory_hostname }}.
+          running-config={{ audit_opts.stdout | default('no output') }},
+          file={{ audit_file.stat | default({}) }},
+          json={{ audit_json.stdout | default('not run') | trim }},
+          rotation={{ audit_selftest.stdout | default('not run') | trim }},
+          installed={{ audit_install.results | map(attribute='stat.exists') | list | default([]) }}.
+        quiet: true
+      when: audit_enabled | default(false) | bool
 
 - name: "06 | smoke test through the real replica-set path (primary write → secondary read → cleanup)"
   hosts: mongo3
@@ -190,7 +289,13 @@
             'fingerprint': ((hostvars[item].fingerprint.stdout | from_json).total
                              if (hostvars[item].fingerprint.stdout is defined) else none),
             'fingerprint_per_db': ((hostvars[item].fingerprint.stdout | from_json).perDb
-                             if (hostvars[item].fingerprint.stdout is defined) else none)
+                             if (hostvars[item].fingerprint.stdout is defined) else none),
+            'audit_running': (hostvars[item].audit_opts.stdout | default('n/a')),
+            'audit_file_bytes': (hostvars[item].audit_file.stat.size
+                             if (hostvars[item].audit_file.stat is defined) else none),
+            'audit_json_shape': (hostvars[item].audit_json.stdout | default('not run') | trim),
+            'audit_rotation_selftest': (hostvars[item].audit_selftest.stdout | default('not run') | trim),
+            'bind_ip': (hostvars[item].bind_ip_observed | default('not recorded'))
           }] }}
       loop: "{{ groups['prod_live'] }}"
       loop_control:

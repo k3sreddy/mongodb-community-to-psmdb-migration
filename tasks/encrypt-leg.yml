@@ -329,6 +329,36 @@
   changed_when: false
   failed_when: false
 
+# Report-only, but it answers the one question the evidence bundle otherwise cannot: which member
+# did this copy actually come from? On leg 2 there are two eligible donors, and with
+# `secondaryPreferred` the primary is allowed to donate as well — so the answer is not derivable
+# from the plan. Recorded next to the log excerpt so the leg is reconstructable a month later,
+# when /var/log/mongodb has already rotated past it.
+- name: "Leg | which member actually donated this copy"
+  ansible.builtin.command:
+    argv: "{{ mongo_base_argv + ['127.0.0.1:' ~ (mongo_port | string) ~ '/admin', '--eval', _sync_source_js] }}"
+  register: sync_src
+  changed_when: false
+  check_mode: false
+  vars:
+    # ES5 on purpose: this must run under both mongosh and the legacy shell.
+    _sync_source_js: >-
+      var m = (rs.status().members || []).filter(function (x) { return x.self; })[0] || {};
+      print(JSON.stringify({ self: m.name, state: m.stateStr,
+      syncSourceHost: m.syncSourceHost || '',
+      syncSourceId: (m.syncSourceId === undefined ? null : m.syncSourceId),
+      uptimeSec: m.uptime, observedAt: new Date().toISOString() }));
+
+- name: "Leg | persist the sync source beside the log excerpt"
+  ansible.builtin.copy:
+    dest: "{{ playbook_dir | dirname }}/artifacts/fcbis-evidence/{{ inventory_hostname }}-{{ leg_method }}-{{ now().strftime('%Y%m%d-%H%M%S') }}-sync-source.json"
+    mode: "0600"
+    content: |
+      {{ sync_src.stdout_lines | last | default('{}') }}
+  delegate_to: localhost
+  changed_when: false
+  failed_when: false
+
 # With no logical backup for this cluster, this fingerprint is the only proof that the wipe
 # actually produced a complete dataset. A short resync must never be allowed to pass silently.
 - name: "Leg | fingerprint the resynced node"
@@ -362,3 +392,4 @@
       - "{{ inventory_hostname }}: {{ leg_method }} sync complete, encrypted ({{ encryption_cipher }}), SECONDARY and in sync."
       - "Documents on resynced node: {{ (leg_fp.stdout | from_json).total }} (baseline {{ baseline_fp_total | default('n/a') }})"
       - "Initial sync took {{ isync_elapsed_sec }} s; log window {{ isync_ev.window_lines }} lines; markers: file-copy={{ isync_ev.marker }}, FCBIS={{ isync_ev.token }}, failed-logical-fallback={{ isync_ev.fallback }}"
+      - "Copy was donated by: {{ (sync_src.stdout_lines | last | default('{}') | from_json).syncSourceHost | default('not reported') }} (evidence in artifacts/fcbis-evidence/)"

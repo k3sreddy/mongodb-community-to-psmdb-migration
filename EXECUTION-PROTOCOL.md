@@ -160,13 +160,25 @@ After each leg: member SECONDARY, lag < 30 s, `encryptionAtRest.encryptionEnable
 members healthy **before** the next leg starts. Never start leg N+1 while leg N is still syncing —
 2 healthy members is your only failover headroom.
 
-### Window 3 — TLS, audit, hardening (~1 h)
+### Window 3 — audit log config, TLS, hardening (~1 h)
+
+**Order is enforced, not a suggestion: `05a` → `05` → `06`.**
 
 ```bash
 ./scripts/issue-certs.sh                      # once, on the control host; PKI lands in artifacts/tls
-ansible-playbook playbooks/05-tls.yml -e change_ticket=CHG -e confirm_window=YES
-ansible-playbook playbooks/06-verify.yml -e change_ticket=CHG
+ansible-playbook playbooks/05a-audit-log.yml -e change_ticket=CHG -e confirm_window=YES
+ansible-playbook playbooks/05-tls.yml        -e change_ticket=CHG -e confirm_window=YES
+ansible-playbook playbooks/06-verify.yml     -e change_ticket=CHG
 ```
+
+`05a` writes the `auditLog` block, the least-privilege `audit-rotator` user and the size-triggered rotation +
+retention cron. It restarts **nothing** and activates **nothing**: mongod reads `auditLog` only at startup,
+and `05-tls` performs this window's only restart. That is why the audit log costs no extra rollout — and why
+`05-tls` refuses to roll if `05a` did not run. If `05a` fails, stop and fix it; nothing is half-applied.
+
+`bindIp` is **not** in scope for this window: it stays `0.0.0.0` by decision (accepted risk R3, README §11).
+The playbooks never merge `net.bindIp`; the baseline and verify reports record it. Do not tighten it here — a
+wrong `bindIp` is a silent outage that only appears when an app reconnects, i.e. on top of the TLS rollout.
 
 The play stages the config on all three members, then restarts **mongo3 → mongo1 → mongo2**, waiting for
 each to be back in service before the next. Watch it: if a member does not come back, the run stops with one
@@ -270,7 +282,9 @@ because it is the entire rollback plan.
 - [ ] Replica set: `mongo2` PRIMARY (priority 2), lag ≤ 2 s, all `health: 1`
 - [ ] Report + manifests filed in `artifacts/` and attached to the change record
 - [ ] Encryption key sha256 recorded in the change record; key DR copies verified readable
-- [ ] Firewall/bindIp decision recorded (either implemented or explicitly deferred with an owner)
+- [ ] Audit log proven on all 3: running process parsed the block, file holds valid JSON, **forced rotation
+      produced a new `audit.log.<stamp>`**, cron + script installed (`06-verify.yml` asserts all four)
+- [ ] `bindIp` recorded as `0.0.0.0` in the verify report — unchanged by decision (R3), no play touched it
 - [ ] App team end-to-end validation signed off
 - [ ] Old RPMs retained ~1 week, then cleaned; logs retained for the audit window
 - [ ] Update `tasks.md` status and notify stakeholders
@@ -278,7 +292,9 @@ because it is the entire rollback plan.
 ## 8. Post-migration backlog (deliberately *not* in these windows)
 
 1. `requireTLS` + `allowConnectionsWithoutCertificates: false` (only after every app URI carries `tls=true`)
-2. `bindIp` restriction + firewalling 27017 to app subnets (needs the CIDR list)
+2. `bindIp` restriction + firewalling 27017 to app subnets (needs the CIDR list). This is **accepted risk
+   R3** here — the value is documented and recorded, deliberately not modified in the same window as a
+   version change, a wipe+resync and a TLS rollout.
 3. Admin password rotation — the current prod admin credential is shared across both clusters and is
    written down in a file in this repo; after the migration it should be rotated and vaulted (and this
    project's vault file becomes the single reference)

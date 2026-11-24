@@ -10,12 +10,24 @@
 - name: "Upgrade | {{ hop }} | never skip a hop (FCV/binary ratchet, guardrail G12)"
   ansible.builtin.assert:
     that:
-      - mongo_build.version is search('^' ~ (expected_prev_major | regex_escape))
-      - mongo_fcv | string is search('^' ~ (expected_prev_major | regex_escape))
+      # `previous_major` OR `hop`: the second alternative is what makes an interrupted window
+      # resumable. If this member's packages were already swapped and the run then died, it is
+      # on `hop` with the FCV still at `previous_major` — re-running the hop must be allowed to
+      # finish, not refused. Nothing two rungs away is ever accepted, so the ratchet still holds.
+      - mongo_build.version is search('^(' ~ (expected_prev_major | regex_escape) ~ '|' ~ (hop | regex_escape) ~ ')')
+      - mongo_fcv | string is search('^(' ~ (expected_prev_major | regex_escape) ~ '|' ~ (hop | regex_escape) ~ ')')
     fail_msg: >-
       {{ inventory_hostname }} runs version={{ mongo_build.version }} fcv={{ mongo_fcv }} but hop
-      {{ hop }} must start from {{ expected_prev_major }}. Run the hops in order.
+      {{ hop }} must start from {{ expected_prev_major }} (or resume a partial {{ hop }}).
+      Run the hops in order.
     quiet: true
+
+- name: "Upgrade | {{ hop }} | is this member already running the target binary? (resume detection)"
+  ansible.builtin.set_fact:
+    # Used only to decide whether mongod has to be stopped. Everything else below is idempotent:
+    # re-installing the same pinned NVR is a dnf no-op ("already installed"), the config staging
+    # keeps its first copy, and re-writing the drop-in/chown/keyfile is harmless.
+    member_on_target_build: "{{ mongo_build.version is search('^' ~ (hop | regex_escape)) }}"
 
 # ── Before anything is stopped: what is installed, and what would collide? ────────
 - name: "Upgrade | {{ hop }} | read the installed package set"
@@ -141,6 +153,9 @@
   ansible.builtin.systemd:
     name: mongod
     state: stopped
+  # On a resumed hop the binary is already the target one and the service may already be running
+  # the right build — stopping it again would be an extra, pointless outage window.
+  when: not member_on_target_build
 
 # Community 5.0.8 ships mongodb-org-*; PSMDB owns the same paths. Installing one over the
 # other is a dnf file-conflict failure — with mongod already stopped that is an outage.
